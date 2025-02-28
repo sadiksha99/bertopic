@@ -38,15 +38,10 @@ stop_words = set(stopwords.words('english'))
 
 # Define the set of important stopwords we want to retain:
 important_stopwords = {
-    # Negation Words (Critical for meaning)
     "not", "never", "nor", "no",
-    # Modality Words (Possibility/Necessity)
     "can", "could", "should", "would", "may", "might", "must",
-    # Quantifiers (Define amounts)
     "all", "any", "some", "many", "much", "few", "more", "most", "several", "less", "least",
-    # Time References (Useful for context)
     "before", "after", "since", "until", "while", "when", "then",
-    # Comparative Words (Relative meaning)
     "than", "as", "like"
 }
 
@@ -55,7 +50,8 @@ stemmer = PorterStemmer()
 
 # Global variables for topic modeling
 topic_model = None
-training_texts = None  # List of texts used for training
+training_texts = None       # Cleaned texts used for training
+original_texts = None       # Original texts (if available) for document visualization
 
 # -----------------------
 # UTILITY FUNCTIONS
@@ -160,7 +156,7 @@ app = FastAPI(
 # API ENDPOINTS
 # -----------------------
 
-# 1. Extract sentences from PDFs or a ZIP file containing PDFs
+# 1. Extract sentences from PDFs or a ZIP file containing PDFs (with optional CSV download)
 @app.post("/extract_pdfs")
 async def extract_pdfs(files: List[UploadFile] = File(...), download: bool = Query(False)):
     """
@@ -244,10 +240,11 @@ async def clean_csv(file: UploadFile = File(...)):
 async def train_model(file: UploadFile = File(...)):
     """
     Upload a cleaned CSV file (with 'sentence_clean' or 'text' column) to train a BERTopic model.
-    The model and training texts are stored globally.
+    The model, training texts, and training probabilities are stored globally.
     After training, predictions and visualizations will use the stored model.
+    If the original 'sentence' column exists, it is stored as original_texts.
     """
-    global topic_model, training_texts
+    global topic_model, training_texts, original_texts
     try:
         contents = await file.read()
         df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
@@ -261,8 +258,14 @@ async def train_model(file: UploadFile = File(...)):
                 detail="CSV must contain a 'sentence_clean' or 'text' column."
             )
         training_texts = df[text_column].astype(str).tolist()
+        # If original sentences exist, store them as well (for document visualization)
+        if "sentence" in df.columns:
+            original_texts = df["sentence"].astype(str).tolist()
+        else:
+            original_texts = training_texts
         from bertopic import BERTopic
-        topic_model = BERTopic(calculate_probabilities=True, min_topic_size=10, nr_topics=20).fit(training_texts)
+        topic_model = BERTopic(calculate_probabilities=True, min_topic_size=10, nr_topics=20)
+        topics, training_probabilities = topic_model.fit_transform(training_texts)
         info = topic_model.get_topic_info().to_dict(orient="records")
         return {"detail": "Model trained successfully", "topic_info": info}
     except Exception as e:
@@ -374,35 +377,36 @@ async def visualize_hierarchy():
 @app.get("/visualize_documents", response_class=HTMLResponse)
 async def visualize_documents():
     """
-    Returns an interactive visualization of document embeddings using the training texts.
+    Returns an interactive visualization of document embeddings using the original texts (if available) or training texts.
     """
-    if topic_model is None or training_texts is None:
-        raise HTTPException(status_code=400, detail="Model not trained or training texts not available. Use /train_model first.")
+    if topic_model is None:
+        raise HTTPException(status_code=400, detail="Model not trained. Use /train_model first.")
     try:
-        fig = topic_model.visualize_documents(training_texts)
+        texts_to_use = original_texts if original_texts is not None else training_texts
+        fig = topic_model.visualize_documents(texts_to_use)
         html = fig.to_html(include_plotlyjs="cdn")
         return HTMLResponse(content=html)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Documents Visualization error: {e}")
 
-# 10. Visualize overall topic distribution (aggregated across training texts)
+# 10. Visualize overall topic distribution (for a given document index)
 @app.get("/visualize_distribution", response_class=HTMLResponse)
-async def visualize_distribution():
+async def visualize_distribution(doc_index: int = Query(0)):
     """
-    Returns an interactive bar chart of overall topic distribution across all training texts.
+    Returns an interactive visualization of the topic distribution for a given document.
+    (Uses the training probabilities stored during model training.)
     """
     if topic_model is None or training_texts is None:
         raise HTTPException(status_code=400, detail="Model not trained or training texts not available. Use /train_model first.")
     try:
-        topics, _ = topic_model.transform(training_texts)
-        unique, counts = np.unique(topics, return_counts=True)
-        distribution = {int(u): int(c) for u, c in zip(unique, counts)}
-        df_dist = pd.DataFrame({"Topic": list(distribution.keys()), "Count": list(distribution.values())})
-        fig = px.bar(df_dist, x="Topic", y="Count", title="Overall Topic Distribution")
+        # Ensure the doc_index is in range
+        if doc_index < 0 or doc_index >= len(training_texts):
+            raise HTTPException(status_code=400, detail="doc_index out of range.")
+        fig = topic_model.visualize_distribution(training_probabilities[doc_index])
         html = fig.to_html(include_plotlyjs="cdn")
         return HTMLResponse(content=html)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Overall Distribution Visualization error: {e}")
+        raise HTTPException(status_code=500, detail=f"Distribution Visualization error: {e}")
 
 # 11. Visualize article topic counts (matplotlib image)
 @app.get("/visualize_article_counts")

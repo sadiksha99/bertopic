@@ -7,151 +7,215 @@
 # 
 # Extracting text from pdf and converting to csv
 
-# In[66]:
+# In[3]:
 
 
-import pdfplumber
-import pandas as pd
+import fitz  # PyMuPDF
 import os
+import pandas as pd
 import re
-from collections import Counter
-import nltk
-from wordsegment import load, segment
 
-# Ensure nltk sentence tokenizer is downloaded
-nltk.download('punkt')
-from nltk.tokenize import sent_tokenize
+# Path to your directory containing the PDFs
+doc_dir = r'C:\Users\sadik\OneDrive\Documenten\Howest\semester6\AI_project\studies\studies'
 
-# Load English word segmentation model
-load()
+# List to store the blocks of text (as individual records)
+data = []
 
-# Folder containing the PDFs
-pdf_folder = r"C:\Users\sadik\OneDrive\Documenten\Howest\semester6\AI_project\studies\studies"
-output_csv_path = r"C:\Users\sadik\OneDrive\Documenten\Howest\semester6\AI_project\Project\all_sentences.csv"
+# Function to check if a line is a heading (all uppercase or starts with 'CHAPTER')
+def is_heading(line):
+    return line.isupper() or line.startswith('CHAPTER')
 
-# Function to split long merged words into meaningful words
-def split_long_words(text):
-    if not isinstance(text, str):
-        return text  # Return as is if not a string
+# Function to check if a line is a footnote (starts with number in brackets, number, or asterisk)
+def is_footnote(line):
+    return re.match(r'^\[\d+\]', line) or re.match(r'^\d+\.', line) or line.startswith('*') or line.startswith('Note') or line.startswith('Table') 
+
+# Function to count words in a block of text
+def count_words(text):
+    return len(text.split())
+
+# Function to filter out lines containing DOI, URLs, specific keywords, or phrases
+def contains_doi_or_https(line):
+    return ('doi' in line.lower() or 
+            'https' in line.lower() or 
+            'http' in line.lower() or 
+            'journal' in line.lower() or 
+            'university' in line.lower() or 
+            'brookville' in line.lower() or
+            'to cite this article' in line.lower() or
+            'full terms & conditions' in line.lower() or
+            'taylor & francis' in line.lower() or
+            'elsevier' in line.lower() or
+            'published by' in line.lower() or
+            'received' in line.lower() or
+            'revised' in line.lower() or
+            'author(s)' in line.lower() or
+            'source:' in line.lower() or
+            'history:' in line.lower() or
+            'keywords' in line.lower() or
+            'vol.' in line.lower() or 
+            'volume' in line.lower() or 
+            'downloaded' in line.lower() or    
+            'article' in line.lower() or
+            'creative commons use' in line.lower() or
+            'author' in line.lower() or 
+            'copyrighted' in line.lower() or
+            'quarterly' in line.lower() or
+            'journal' in line.lower() or
+            'purtell' in line.lower() or
+            'resources:' in line.lower() or
+            'publisher' in line.lower() or
+            'ying' in line.lower() or
+            'cincinnati' in line.lower() or
+            'ISSN' in line.lower() or
+            'All rights reserved' in line.lower() or
+            'authors' in line.lower())
+
+# Function to check if a line is part of the reference or acknowledgements section
+def is_reference_or_acknowledgements_section(line):
+    reference_markers = ['references', 'bibliography', 'acknowledgements', 'nederlandse', 'method',"methods"]
+    return any(marker in line.lower() for marker in reference_markers)
+
+# Function to replace ligatures with their individual characters
+def replace_ligatures(text):
+    ligatures = {
+        'ﬁ': 'fi',
+        'ﬂ': 'fl',
+        'ﬃ': 'ffi',
+        'ﬄ': 'ffl',
+        'ﬀ': 'ff',
+        'ﬂ': 'fl',
+    }
+    for ligature, replacement in ligatures.items():
+        text = text.replace(ligature, replacement)
+    return text
+
+# Function to fix common word splits
+def fix_common_word_splits(text):
+    common_fixes = {
+        'signi ficant': 'significant',
+        'di fferent': 'different',
+        'e ffective': 'effective',
+        'e ffect': 'effect',
+        'chil dren': 'children',
+        'e ff ective': 'effective',
+        'con fi dence': 'confidence',
+    }
+    for split_word, correct_word in common_fixes.items():
+        text = text.replace(split_word, correct_word)
     
-    words = text.split()  # Split text into individual words
-    processed_text = []
+    text = re.sub(r'\b(\w{3,})\s+(\w{3,})\b', r'\1 \2', text)  # Adjust spaces if needed
+    return text
 
-    for word in words:
-        if len(word) > 10:  # Threshold for long words
-            segmented_word = " ".join(segment(word))  # Use wordsegment to break into words
-            processed_text.append(segmented_word)
-        else:
-            processed_text.append(word)
-    
-    return " ".join(processed_text)
+# Loop through each file in the directory
+for filename in os.listdir(doc_dir):
+    if filename.endswith('.pdf'):  # Only process PDF files
+        file_path = os.path.join(doc_dir, filename)
 
-# Function to extract and clean sentences from a PDF
-def extract_clean_sentences_from_pdf(pdf_path):
-    text_data = []
-    headers = Counter()
-    footers = Counter()
-    filename = os.path.basename(pdf_path)  # Extract file name
+        # Extract the title of the PDF (filename without the '.pdf' extension)
+        title = os.path.splitext(filename)[0]
 
-    with pdfplumber.open(pdf_path) as pdf:
-        # Detect common headers/footers
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                lines = text.split("\n")
-                if len(lines) > 2:
-                    headers[lines[0]] += 1  # First line as potential header
-                    footers[lines[-1]] += 1  # Last line as potential footer
+        # Open the PDF file using PyMuPDF
+        pdf_document = fitz.open(file_path)
 
-        # Identify the most common header/footer
-        common_header = headers.most_common(1)[0][0] if headers else ""
-        common_footer = footers.most_common(1)[0][0] if footers else ""
+        # Flag to indicate if we are in the reference or acknowledgements section for the entire document
+        section_reached = False
 
-        # Extract and clean text
-        for page_num, page in enumerate(pdf.pages):
-            text = page.extract_text()
+        # Iterate through each page in the PDF
+        for page_num in range(pdf_document.page_count):
+            if section_reached:
+                break  # Stop processing further pages if the section marker was reached
 
-            if text:
-                lines = text.split("\n")
+            page = pdf_document.load_page(page_num)  # Load a page by page number
+            text_dict = page.get_text("dict")  # Extract text in dictionary format to preserve layout
+            
+            # Substitute all semicolons (;) with commas (,)
+            for block in text_dict["blocks"]:
+                if block["type"] == 0:  # Type 0 is a text block
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            span["text"] = span["text"].replace(';', ',')
+            
+            # Process each block of text on the page
+            for block in text_dict["blocks"]:
+                if block["type"] == 0:  # Type 0 is a text block
+                    block_text = ""
+                    prev_x = None  # To store the previous x-coordinate (indentation level)
+                    paragraph = []  # List to store lines that belong to the same paragraph
 
-                # Remove detected headers and footers
-                if len(lines) > 2:
-                    if lines[0] == common_header:
-                        lines.pop(0)  # Remove header
-                    if lines[-1] == common_footer:
-                        lines.pop(-1)  # Remove footer
+                    for line in block["lines"]:
+                        # Get the text from the line
+                        line_text = " ".join([span["text"] for span in line["spans"]])
 
-                # Join cleaned lines back into text
-                cleaned_text = "\n".join(lines)
+                        # Apply ligature replacement and common word fixes
+                        line_text = replace_ligatures(line_text)
+                        line_text = fix_common_word_splits(line_text)
 
-                # Further cleanup: remove excessive spaces, page numbers, and metadata
-                cleaned_text = re.sub(r"\s{2,}", " ", cleaned_text)  # Remove extra spaces
-                cleaned_text = re.sub(r"Page \d+", "", cleaned_text)  # Remove page numbers
-                cleaned_text = re.sub(r"\n+", " ", cleaned_text)  # Remove extra line breaks
+                        # **Immediately stop processing if the reference/acknowledgements section is detected**
+                        if is_reference_or_acknowledgements_section(line_text):
+                            section_reached = True
+                            break  # Exit the inner loop and stop processing this file
+                        
+                        # Skip if it's a header, footnote, contains DOI/URL, or matches the title of the PDF
+                        if is_heading(line_text) or is_footnote(line_text) or contains_doi_or_https(line_text) or line_text.strip().lower() == title.lower():
+                            continue
 
-                # Tokenize into sentences
-                sentences = sent_tokenize(cleaned_text.strip())
+                        # Get the x-coordinate (horizontal position of the first word in the line)
+                        first_word_x = line["spans"][0]["bbox"][0]
 
-                # Save each sentence as a separate row with filename
-                for sentence in sentences:
-                    cleaned_sentence = split_long_words(sentence)  # Apply word segmentation
-                    text_data.append({
-                        "filename": filename,
-                        "Page": page_num + 1,
-                        "sentence": cleaned_sentence
-                    })
+                        # Check if the line belongs to the same paragraph (by horizontal position)
+                        if prev_x is None or first_word_x - prev_x < 10:  # If the line's x is close to the previous, it's part of the same paragraph
+                            paragraph.append(line_text)
+                        else:
+                            # When indentation changes significantly, treat this as the start of a new paragraph
+                            if paragraph:  # If there's already accumulated text, store it as a block
+                                full_paragraph_text = " ".join(paragraph).strip()
+                                if count_words(full_paragraph_text) >= 10:  # Skip blocks with less than 10 words
+                                    data.append([filename, page_num + 1, full_paragraph_text])
+                            paragraph = [line_text]  # Start a new paragraph
 
-    return text_data
+                        prev_x = first_word_x  # Update the previous x-coordinate
 
-# Function to process all PDFs in the folder and save to CSV
-def process_all_pdfs(pdf_folder, output_csv_path):
-    all_text_data = []
+                    # If section_reached is True after breaking, break the outer loop as well
+                    if section_reached:
+                        break
 
-    # Loop through all PDF files in the folder
-    for pdf_file in os.listdir(pdf_folder):
-        if pdf_file.endswith(".pdf"):  # Only process PDF files
-            pdf_path = os.path.join(pdf_folder, pdf_file)
-            print(f" Processing: {pdf_file}")
-            text_data = extract_clean_sentences_from_pdf(pdf_path)
-            all_text_data.extend(text_data)  # Append extracted text
+                    # If there's any accumulated paragraph, add it to the data
+                    if paragraph and not section_reached:
+                        full_paragraph_text = " ".join(paragraph).strip()
+                        if count_words(full_paragraph_text) >= 10:  # Skip blocks with less than 10 words
+                            data.append([filename, page_num + 1, full_paragraph_text])
 
-    # Save to a single CSV file
-    df = pd.DataFrame(all_text_data)
+# Convert the data to a DataFrame (optional)
+df = pd.DataFrame(data, columns=["File", "Page", "text"])
 
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+# Print the first few records
+print(df.head())
 
-    df.to_csv(output_csv_path, index=False, encoding='utf-8')
-    print(f"All PDFs processed! CSV saved at: {output_csv_path}")
 
-# Run the function to process all PDFs
-process_all_pdfs(pdf_folder, output_csv_path)
+# In[4]:
 
-# Load CSV and display first few rows
-df = pd.read_csv(output_csv_path)
 
-# Display the cleaned DataFrame
-print(" Extracted and Cleaned Sentences DataFrame:")
-display(df.head())  # Display the first few rows of cleaned sentences
+# save the DataFrame to a CSV file
+df.to_csv("studies_lobke.csv", index=False)
 
 
 # # 2.  Load Your Data
 # 
 # Load the articles from your CSV file using pandas. 
 
-# In[19]:
+# In[33]:
 
 
 import pandas as pd
 
 # Load the data
-df= pd.read_csv(r'C:\Users\sadik\OneDrive\Documenten\Howest\semester6\AI_project\project\all_sentences.csv')
+df= pd.read_csv(r'C:\Users\sadik\OneDrive\Documenten\Howest\semester6\AI_project\project\studies_lobke.csv')
 df.head()
 
 
 # ### Removing any personal informtion to anonymize data  
 
-# In[20]:
+# In[34]:
 
 
 import spacy
@@ -179,7 +243,7 @@ def remove_sensitive_info(text):
     return cleaned_text.strip()
 
 # Apply function to remove names, personal info, dates, and numbers from df['sentence_clean']
-df['sentence_clean'] = df['sentence'].apply(remove_sensitive_info)
+df['text_clean'] = df['text'].apply(remove_sensitive_info)
 
 # Display cleaned dataframe
 display(df.head())
@@ -200,7 +264,7 @@ display(df.head())
 # 
 # 
 
-# In[21]:
+# In[35]:
 
 
 import spacy
@@ -220,13 +284,13 @@ def remove_geographical_entities(text):
     return " ".join(filtered_tokens)
 
 # Apply function to remove cities, countries, and geography
-df['sentence_clean'] = df['sentence'].apply(remove_geographical_entities)
+df['text_clean'] = df['text'].apply(remove_geographical_entities)
 
 # Display a few cleaned sentences
 df.head()
 
 
-# In[22]:
+# In[36]:
 
 
 import re
@@ -261,7 +325,7 @@ important_stopwords = {
 stop_words -= important_stopwords
 
 # Minimum word length threshold
-minWordSize = 4
+minWordSize = 2
 
 # Initialize the WordNetLemmatizer and PorterStemmer
 lemmatizer = WordNetLemmatizer()
@@ -271,15 +335,9 @@ stemmer = PorterStemmer()
 def preprocess_text(text):
     if not isinstance(text, str):
         return ""  # Handle missing or non-string values
-    
-    # Remove URLs (http, https, www, etc.)
-    text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
-    
+
     # Normalize Unicode characters
     text = unicodedata.normalize('NFKD', text)
-    
-    # Replace non-alphabetic characters with a space
-    text = re.sub(r'[^a-zA-Z\s]', ' ', text)
 
     # Convert text to lowercase and split into words
     words = text.lower().split()
@@ -303,31 +361,13 @@ def preprocess_text(text):
     return " ".join(unique_words)
 
 # Apply preprocessing function to clean sentences
-df['sentence_clean'] = df['sentence_clean'].apply(preprocess_text)
-
-# Identify and remove duplicate sentences
-sentence_counts = Counter(df['sentence_clean'])
-
-# Remove sentences that appear multiple times
-df = df[df['sentence_clean'].map(sentence_counts) == 1]
+df['text_clean'] = df['text_clean'].apply(preprocess_text)
 
 # Display the first elements after processing
 df.head()
 
 
-# In[23]:
-
-
-df['sentence_clean'].is_unique
-
-
-# In[24]:
-
-
-df = df[df['sentence_clean'].str.len() >=10]
-
-
-# In[25]:
+# In[38]:
 
 
 df.info()
@@ -335,7 +375,7 @@ df.info()
 
 # ### To see how data cleaning looks 
 
-# In[ ]:
+# In[39]:
 
 
 import os
@@ -357,7 +397,7 @@ print(f"✅ Cleaned data saved at: {output_path}")
 
 # ### Read the clean data 
 
-# In[28]:
+# In[40]:
 
 
 import pandas as pd
@@ -377,14 +417,7 @@ df.head()
 # 
 # To get started, let's just use the default settings.
 
-# In[29]:
-
-
-unique_filenames_count = df['filename'].nunique()
-print(unique_filenames_count)
-
-
-# In[30]:
+# In[41]:
 
 
 from bertopic import BERTopic
@@ -394,30 +427,27 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 topic_model = BERTopic(calculate_probabilities=True)
 
 # Fit the model with preprocessed text sentences
-topics, probabilities = topic_model.fit_transform(df['sentence_clean'])
+topics, probabilities = topic_model.fit_transform(df['text_clean'])
 
 # View and inspect topics
 topic_model.get_topic_info()
 
 
-# we get here too much topics  132, later we can make sure that the topic are limited to certain number of topics for better analysis and understanding
-# 
-
-# In[31]:
+# In[43]:
 
 
 # Initialize BERTopic model
-topic_model = BERTopic(calculate_probabilities=True, min_topic_size=10, nr_topics=20)
+topic_model = BERTopic(calculate_probabilities=True, min_topic_size=5, nr_topics=10)
 
 # Fit the model with preprocessed text sentences
-topics, probabilities = topic_model.fit_transform(df['sentence_clean'])
+topics, probabilities = topic_model.fit_transform(df['text_clean'])
 
 # View and inspect topics
 topic_model.get_topic_info()
 
 
 
-# In[34]:
+# In[44]:
 
 
 topic_model.topics_[:20]
@@ -425,15 +455,7 @@ topic_model.topics_[:20]
 
 # ### Here we reduce the number of topics with the number of pdf files we have uploaded
 
-# In[35]:
-
-
-topics = int(unique_filenames_count)
-topic_model = BERTopic().fit(df['sentence_clean'])
-topic_model.reduce_topics(df['sentence_clean'], nr_topics=(topics))
-
-
-# In[37]:
+# In[45]:
 
 
 print(topic_model.topics_)
@@ -441,27 +463,27 @@ print(topic_model.topics_)
 
 # ### Here we can search an attribute that is related to certain topics
 
-# In[38]:
+# In[46]:
 
 
 similar_topics, similarity = topic_model.find_topics("stress"); similar_topics
 
 
-# In[39]:
+# In[47]:
 
 
 similar_topics, similarity = topic_model.find_topics("happy"); similar_topics
 
 
-# In[41]:
+# In[49]:
 
 
-topic_model.get_topic(16)
+topic_model.get_topic(6)
 
 
 # ### topic limited to the pdf count
 
-# In[42]:
+# In[50]:
 
 
 topic_model.get_topic(30)
@@ -472,7 +494,7 @@ topic_model.get_topic(30)
 # 
 # Note: If you get the error 'ValueError: Mime type rendering requires nbformat>=4.2.0 but it is not installed', go to terminal and type 'pip install --upgrade nbformat  ' 
 
-# In[43]:
+# In[51]:
 
 
 # Visualize topics with an interactive plot
@@ -483,7 +505,7 @@ topic_model.visualize_topics()
 # 
 # We can also ask for a representation of the corresponding words for each topic:
 
-# In[44]:
+# In[52]:
 
 
 topic_model.visualize_barchart()
@@ -492,10 +514,10 @@ topic_model.visualize_barchart()
 # # 6. Visualize Topic Hierarchy¶
 # The topics that were created can be hierarchically reduced. In order to understand the potential hierarchical structure of the topics, we can use scipy.cluster.hierarchy to create clusters and visualize how they relate to one another. We can also see what happens to the topic representations when merging topics. 
 
-# In[45]:
+# In[54]:
 
 
-hierarchical_topics = topic_model.hierarchical_topics(df['sentence_clean'])
+hierarchical_topics = topic_model.hierarchical_topics(df['text_clean'])
 topic_model.visualize_hierarchy(hierarchical_topics=hierarchical_topics)
 
 
@@ -514,16 +536,16 @@ print(tree)
 # 
 # We can visualize the documents (=texts) inside the topics to see if they were assigned correctly or whether they make sense. To do so, we can use the topic_model.visualize_documents() function. This function recalculates the document embeddings and reduces them to 2-dimensional space for easier visualization purposes. 
 
-# In[47]:
+# In[56]:
 
 
 df = df.reset_index(drop=True)  # Reset index to avoid KeyError
-topic_model.visualize_documents(df['sentence'].tolist())  # Convert Series to list
+topic_model.visualize_documents(df['text'].tolist())  # Convert Series to list
 
 
 # When you hover over a point, you can see which text it is. The color tells you to which topic it belongs. While this is very pretty, it might be useful to be able to just open an excel-file or csv, which contains the original text, with the assigned topic, including the topic words:
 
-# In[48]:
+# In[57]:
 
 
 import numpy as np
@@ -544,7 +566,7 @@ df['topic_name'] = df['topic_number'].map(topic_names)
 df.to_csv("studies_lobke_with_topics.csv", index=False)
 
 
-# In[49]:
+# In[58]:
 
 
 df.head()
@@ -555,20 +577,20 @@ df.head()
 # In[60]:
 
 
-topic_model.visualize_distribution(probabilities[300])
+topic_model.visualize_distribution(probabilities[5])
 
 
 # # 8. Topics per full article
 # 
 # We extract the number of times a topic is assigned within the full articles.
 
-# In[61]:
+# In[62]:
 
 
 import matplotlib.pyplot as plt
 
 # Calculate the count of times each topic is chosen within each article
-article_topic_counts = df.groupby('filename')['topic_number'].value_counts().unstack(fill_value=0)
+article_topic_counts = df.groupby('File')['topic_number'].value_counts().unstack(fill_value=0)
 
 # Rename columns to 'Topic X'
 article_topic_counts.columns = [f'Topic {i}' for i in article_topic_counts.columns]
@@ -587,13 +609,13 @@ plt.show()
 
 # We could also do the same, but with proportions in stead of counts.
 
-# In[62]:
+# In[63]:
 
 
 import matplotlib.pyplot as plt
 
 # Calculate the proportion of times each topic is chosen within each article
-article_topic_proportions = df.groupby('filename')['topic_number'].value_counts(normalize=True).unstack(fill_value=0)
+article_topic_proportions = df.groupby('File')['topic_number'].value_counts(normalize=True).unstack(fill_value=0)
 
 # Rename columns to 'Topic X'
 article_topic_proportions.columns = [f'Topic {i}' for i in article_topic_proportions.columns]
@@ -612,7 +634,7 @@ plt.show()
 
 #  The highest related topic is child_classroom_behavior it makes sense because we are working with data to see how childeren change of what effects the psychology of child after finishing the elementary school and entering to high school.
 
-# In[ ]:
+# In[63]:
 
 
 import nbformat
