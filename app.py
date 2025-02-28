@@ -6,15 +6,14 @@ import pandas as pd
 import io
 import os
 import re
-from collections import Counter
-import pdfplumber
+import fitz  # PyMuPDF
 import nltk
+from nltk import download
 from wordsegment import load, segment
 import spacy
 import unicodedata
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer, PorterStemmer
-from nltk import download
 import numpy as np
 from typing import List
 import zipfile
@@ -33,10 +32,9 @@ download('stopwords')
 
 load()  # Load wordsegment model
 nlp = spacy.load("en_core_web_sm")
-# Load all standard stopwords
 stop_words = set(stopwords.words('english'))
 
-# Define the set of important stopwords we want to retain:
+# Define the set of important stopwords to retain:
 important_stopwords = {
     "not", "never", "nor", "no",
     "can", "could", "should", "would", "may", "might", "must",
@@ -48,77 +46,162 @@ important_stopwords = {
 lemmatizer = WordNetLemmatizer()
 stemmer = PorterStemmer()
 
-# Global variables for topic modeling
+# -----------------------
+# GLOBAL VARIABLES
+# -----------------------
 topic_model = None
-training_texts = None       # Cleaned texts used for training
-original_texts = None       # Original texts (if available) for document visualization
+training_texts = None         # Cleaned texts used for training
+original_texts = None         # Original texts (if available) for visualization
+training_probabilities = None # Stored probabilities from training
 
 # -----------------------
-# UTILITY FUNCTIONS
+# HELPER: GET TOPIC LABEL (for last 2 visualizations)
 # -----------------------
+def get_topic_label(topic_id: int, n_words: int = 3) -> str:
+    """
+    Return a short label for a topic, e.g. "Topic 0: word1, word2, word3".
+    If topic_id == -1, label as 'Outliers'.
+    """
+    global topic_model
+    if topic_id == -1:
+        return "Topic -1: Outliers"
+    words_and_weights = topic_model.get_topic(topic_id)
+    if not words_and_weights:
+        return f"Topic {topic_id}"
+    top_words = [w for (w, _) in words_and_weights[:n_words]]
+    return f"Topic {topic_id}: {', '.join(top_words)}"
 
-# --- PDF Extraction Functions ---
-def split_long_words(text: str) -> str:
-    if not isinstance(text, str):
-        return text
-    words = text.split()
-    processed_text = []
-    for word in words:
-        if len(word) > 10:
-            segmented_word = " ".join(segment(word))
-            processed_text.append(segmented_word)
-        else:
-            processed_text.append(word)
-    return " ".join(processed_text)
 
-def extract_clean_sentences_from_pdf(pdf_path: str):
-    text_data = []
-    headers = Counter()
-    footers = Counter()
+# -----------------------
+# PDF TEXT EXTRACTION FUNCTIONS (Using PyMuPDF)
+# -----------------------
+def is_heading(line: str) -> bool:
+    return line.isupper() or line.startswith('CHAPTER')
+
+def is_footnote(line: str) -> bool:
+    return (
+        re.match(r'^\[\d+\]', line) or
+        re.match(r'^\d+\.', line) or
+        line.startswith('*') or
+        line.startswith('Note') or
+        line.startswith('Table')
+    )
+
+def count_words(text: str) -> int:
+    return len(text.split())
+
+def contains_doi_or_https(line: str) -> bool:
+    return (
+        'doi' in line.lower() or
+        'https' in line.lower() or
+        'http' in line.lower() or
+        'journal' in line.lower() or
+        'university' in line.lower()
+    )
+
+def is_reference_or_acknowledgements_section(line: str) -> bool:
+    markers = ['references', 'bibliography', 'acknowledgements', 'nederlandse', 'method', "methods"]
+    return any(marker in line.lower() for marker in markers)
+
+def replace_ligatures(text: str) -> str:
+    ligatures = {
+        'ﬁ': 'fi',
+        'ﬂ': 'fl',
+        'ﬃ': 'ffi',
+        'ﬄ': 'ffl',
+        'ﬀ': 'ff'
+    }
+    for lig, repl in ligatures.items():
+        text = text.replace(lig, repl)
+    return text
+
+def fix_common_word_splits(text: str) -> str:
+    fixes = {
+        'signi ficant': 'significant',
+        'di fferent': 'different',
+        'e ffective': 'effective',
+        'e ffect': 'effect',
+        'chil dren': 'children',
+        'e ff ective': 'effective',
+        'con fi dence': 'confidence',
+    }
+    for split_word, correct in fixes.items():
+        text = text.replace(split_word, correct)
+    text = re.sub(r'\b(\w{3,})\s+(\w{3,})\b', r'\1 \2', text)
+    return text
+
+def extract_text_from_pdf_fitz(pdf_path: str):
+    """
+    Extracts paragraphs from a PDF using PyMuPDF with custom cleaning.
+    Returns a list of records: [File, Page, text].
+    """
+    import fitz
+    data = []
+    doc = fitz.open(pdf_path)
     filename = os.path.basename(pdf_path)
-    with pdfplumber.open(pdf_path) as pdf:
-        # Detect common headers/footers
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                lines = text.split("\n")
-                if len(lines) > 2:
-                    headers[lines[0]] += 1
-                    footers[lines[-1]] += 1
-        common_header = headers.most_common(1)[0][0] if headers else ""
-        common_footer = footers.most_common(1)[0][0] if footers else ""
-        # Process each page
-        for page_num, page in enumerate(pdf.pages):
-            text = page.extract_text()
-            if text:
-                lines = text.split("\n")
-                if len(lines) > 2:
-                    if lines[0] == common_header:
-                        lines.pop(0)
-                    if lines[-1] == common_footer:
-                        lines.pop(-1)
-                cleaned_text = "\n".join(lines)
-                cleaned_text = re.sub(r"\s{2,}", " ", cleaned_text)
-                cleaned_text = re.sub(r"Page \d+", "", cleaned_text)
-                cleaned_text = re.sub(r"\n+", " ", cleaned_text)
-                sentences = nltk.tokenize.sent_tokenize(cleaned_text.strip())
-                for sentence in sentences:
-                    cleaned_sentence = split_long_words(sentence)
-                    text_data.append({
-                        "filename": filename,
-                        "Page": page_num + 1,
-                        "sentence": cleaned_sentence
-                    })
-    return text_data
+    section_reached = False
 
-# --- Cleaning Functions for CSV Data ---
+    for page_num in range(doc.page_count):
+        if section_reached:
+            break
+        page = doc.load_page(page_num)
+        text_dict = page.get_text("dict")
+
+        # Replace semicolons with commas in spans
+        for block in text_dict["blocks"]:
+            if block["type"] == 0:
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        span["text"] = span["text"].replace(';', ',')
+
+        for block in text_dict["blocks"]:
+            if block["type"] == 0:
+                paragraph = []
+                prev_x = None
+                for line in block["lines"]:
+                    line_text = " ".join(span["text"] for span in line["spans"])
+                    line_text = replace_ligatures(line_text)
+                    line_text = fix_common_word_splits(line_text)
+
+                    if is_reference_or_acknowledgements_section(line_text):
+                        section_reached = True
+                        break
+
+                    if (
+                        is_heading(line_text) or
+                        is_footnote(line_text) or
+                        contains_doi_or_https(line_text) or
+                        line_text.strip().lower() == filename.lower()
+                    ):
+                        continue
+
+                    first_word_x = line["spans"][0]["bbox"][0]
+                    if prev_x is None or abs(first_word_x - prev_x) < 10:
+                        paragraph.append(line_text)
+                    else:
+                        if paragraph and count_words(" ".join(paragraph)) >= 10:
+                            data.append([filename, page_num + 1, " ".join(paragraph).strip()])
+                        paragraph = [line_text]
+                    prev_x = first_word_x
+
+                if paragraph and not section_reached and count_words(" ".join(paragraph)) >= 10:
+                    data.append([filename, page_num + 1, " ".join(paragraph).strip()])
+
+    return data
+
+# -----------------------
+# CLEANING FUNCTIONS
+# -----------------------
 def remove_sensitive_info(text: str) -> str:
     if not isinstance(text, str):
         return ""
     doc = nlp(text)
+    # Remove person names
     words = [token.text for token in doc if token.ent_type_ != "PERSON"]
     cleaned_text = " ".join(words)
+    # Remove date-like patterns
     cleaned_text = re.sub(r'\b\d{1,4}[-/]\d{1,2}[-/]\d{1,4}\b', '', cleaned_text)
+    # Remove standalone numbers
     cleaned_text = re.sub(r'\b\d+\b', '', cleaned_text)
     return cleaned_text.strip()
 
@@ -126,196 +209,212 @@ def remove_geographical_entities(text: str) -> str:
     if not isinstance(text, str):
         return ""
     doc = nlp(text)
+    # Remove GPE, LOC, FAC
     filtered_tokens = [token.text for token in doc if token.ent_type_ not in ["GPE", "LOC", "FAC"]]
     return " ".join(filtered_tokens)
 
 def preprocess_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
-    text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
+    # Remove URLs
+    text = re.sub(r'http\S+|www\S+|https\S+', '', text)
+    # Normalize unicode
     text = unicodedata.normalize('NFKD', text)
+    # Keep only letters/spaces
     text = re.sub(r'[^a-zA-Z\s]', ' ', text)
     words = text.lower().split()
-    # Keep words if they are not in stop_words OR if they are in important_stopwords.
-    filtered_words = [word for word in words if not (word in stop_words and word not in important_stopwords)]
-    lemmatized_words = [lemmatizer.lemmatize(word) for word in filtered_words]
-    stemmed_words = [stemmer.stem(word) for word in lemmatized_words]
-    final_words = [w for w in stemmed_words if len(w) >= 4]
+    # Remove stopwords except important ones
+    filtered_words = [
+        w for w in words 
+        if not (w in stop_words and w not in important_stopwords)
+    ]
+    # Lemmatize
+    lemmatized = [lemmatizer.lemmatize(w) for w in filtered_words]
+    # Stem
+    stemmed = [stemmer.stem(w) for w in lemmatized]
+    # Keep words of length >= 4
+    final_words = [w for w in stemmed if len(w) >= 4]
+    # Remove duplicates while preserving order
     unique_words = list(dict.fromkeys(final_words))
     return " ".join(unique_words)
 
 # -----------------------
-# FASTAPI SETUP
+# FASTAPI INITIALIZATION
 # -----------------------
 app = FastAPI(
     title="PDF/CSV to BERTopic API",
-    description="Upload files until model training. After that, use prediction and visualization endpoints without file uploads."
+    description="Upload files until model training. Then use predictions & visualizations."
 )
 
 # -----------------------
-# API ENDPOINTS
+# 1) EXTRACT + CLEAN
 # -----------------------
-
-# 1. Extract sentences from PDFs or a ZIP file containing PDFs (with optional CSV download)
-@app.post("/extract_pdfs")
-async def extract_pdfs(files: List[UploadFile] = File(...), download: bool = Query(False)):
+@app.post("/extract_clean")
+async def extract_clean(
+    files: List[UploadFile] = File(...),
+    download: bool = Query(True)
+):
     """
-    Upload one or more PDF files OR a ZIP file containing PDFs.
-    Extracts cleaned sentences from each PDF and groups results by source filename.
-    If 'download' is True, returns the results as a CSV file; otherwise, returns JSON.
+    Upload PDF(s) or a ZIP with PDFs, extracts + cleans them.
+    Returns CSV for download or JSON if download=false.
     """
     try:
         all_rows = []
-        response = {}
         for file in files:
+            # Handle ZIP
             if file.filename.lower().endswith(".zip"):
                 with tempfile.TemporaryDirectory() as tmpdirname:
                     zip_path = os.path.join(tmpdirname, file.filename)
                     with open(zip_path, "wb") as f:
                         f.write(await file.read())
-                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    with zipfile.ZipFile(zip_path, "r") as zip_ref:
                         zip_ref.extractall(tmpdirname)
+
                     for root, _, filenames in os.walk(tmpdirname):
                         for fname in filenames:
                             if fname.lower().endswith(".pdf"):
                                 pdf_path = os.path.join(root, fname)
-                                extracted = extract_clean_sentences_from_pdf(pdf_path)
-                                response.setdefault(fname, []).extend(extracted)
-                                all_rows.extend(extracted)
+                                extracted = extract_text_from_pdf_fitz(pdf_path)
+                                all_rows.extend({
+                                    "File": r[0], "Page": r[1], "text": r[2]
+                                } for r in extracted)
+
+            # Handle single PDF
             elif file.filename.lower().endswith(".pdf"):
                 contents = await file.read()
                 temp_path = f"temp_{file.filename}"
                 with open(temp_path, "wb") as f:
                     f.write(contents)
-                extracted = extract_clean_sentences_from_pdf(temp_path)
-                response.setdefault(file.filename, []).extend(extracted)
-                all_rows.extend(extracted)
+                extracted = extract_text_from_pdf_fitz(temp_path)
+                all_rows.extend({
+                    "File": r[0], "Page": r[1], "text": r[2]
+                } for r in extracted)
                 os.remove(temp_path)
+
             else:
-                raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}")
+                raise HTTPException(400, f"Unsupported file type: {file.filename}")
+
+        df = pd.DataFrame(all_rows)
+
+        # Clean text
+        df["text_clean"] = df["text"].apply(remove_sensitive_info)
+        df["text_clean"] = df["text_clean"].apply(remove_geographical_entities)
+        df["text_clean"] = df["text_clean"].apply(preprocess_text)
+
         if download:
-            df = pd.DataFrame(all_rows)
             output = io.StringIO()
             df.to_csv(output, index=False)
             output.seek(0)
             return StreamingResponse(
                 output,
                 media_type="text/csv",
-                headers={"Content-Disposition": "attachment; filename=extracted_sentences.csv"}
+                headers={"Content-Disposition": "attachment; filename=extracted_cleaned_texts.csv"}
             )
         else:
-            return {"extracted_sentences": response}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF Extraction error: {e}")
+            return {"extracted_cleaned_texts": df.to_dict(orient="records")}
 
-# 2. Clean an uploaded CSV file
-@app.post("/clean_csv")
-async def clean_csv(file: UploadFile = File(...)):
-    """
-    Upload a CSV file with a 'sentence' column.
-    Removes sensitive information, geographic entities, and preprocesses text.
-    Returns a CSV file with a new column 'sentence_clean'.
-    """
-    try:
-        contents = await file.read()
-        df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
-        if "sentence" not in df.columns:
-            raise HTTPException(status_code=400, detail="CSV must contain a 'sentence' column.")
-        df['sentence_clean'] = df['sentence'].apply(remove_sensitive_info)
-        df['sentence_clean'] = df['sentence_clean'].apply(remove_geographical_entities)
-        df['sentence_clean'] = df['sentence_clean'].apply(preprocess_text)
-        output = io.StringIO()
-        df.to_csv(output, index=False)
-        output.seek(0)
-        return StreamingResponse(
-            output,
-            media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=cleaned_data.csv"}
-        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"CSV Cleaning error: {e}")
+        raise HTTPException(500, f"Extract and Clean error: {e}")
 
-# 3. Train BERTopic model from an uploaded cleaned CSV file
+# -----------------------
+# 2) TRAIN MODEL (ONLY "text_clean")
+# -----------------------
 @app.post("/train_model")
 async def train_model(file: UploadFile = File(...)):
     """
-    Upload a cleaned CSV file (with 'sentence_clean' or 'text' column) to train a BERTopic model.
+    Upload a cleaned CSV file (with 'text_clean' column) to train a BERTopic model.
     The model, training texts, and training probabilities are stored globally.
     After training, predictions and visualizations will use the stored model.
-    If the original 'sentence' column exists, it is stored as original_texts.
+    If a 'text' column exists, it is stored as original_texts for visualization; else we use 'text_clean'.
     """
-    global topic_model, training_texts, original_texts
+    global topic_model, training_texts, original_texts, training_probabilities
     try:
         contents = await file.read()
         df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
-        if "sentence_clean" in df.columns:
-            text_column = "sentence_clean"
-        elif "text" in df.columns:
-            text_column = "text"
-        else:
+
+        # We only accept "text_clean"
+        if "text_clean" not in df.columns:
             raise HTTPException(
                 status_code=400,
-                detail="CSV must contain a 'sentence_clean' or 'text' column."
+                detail="CSV must contain a 'text_clean' column."
             )
-        training_texts = df[text_column].astype(str).tolist()
-        # If original sentences exist, store them as well (for document visualization)
-        if "sentence" in df.columns:
-            original_texts = df["sentence"].astype(str).tolist()
+
+        # Convert "text_clean" to a list of strings
+        training_texts = df["text_clean"].astype(str).tolist()
+
+        # If there's a "text" column, store for visualization
+        if "text" in df.columns:
+            original_texts = df["text"].astype(str).tolist()
         else:
             original_texts = training_texts
-        from bertopic import BERTopic
-        topic_model = BERTopic(calculate_probabilities=True, min_topic_size=10, nr_topics=20)
-        topics, training_probabilities = topic_model.fit_transform(training_texts)
-        info = topic_model.get_topic_info().to_dict(orient="records")
-        return {"detail": "Model trained successfully", "topic_info": info}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Model Training error: {e}")
 
-# 4. Predict topic for a single text input
+        # Import inside endpoint
+        from bertopic import BERTopic
+
+        # Train the model
+        topic_model = BERTopic(calculate_probabilities=True, min_topic_size=10, nr_topics=20)
+        topics, training_probabilities_var = topic_model.fit_transform(training_texts)
+        training_probabilities = training_probabilities_var
+
+        info = topic_model.get_topic_info().to_dict(orient="records")
+        return {
+            "detail": "Model trained successfully",
+            "topic_info": info
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Model Training error: {e}")
+
+# -----------------------
+# 3) PREDICT TOPIC (SINGLE TEXT)
+# -----------------------
 class TextData(BaseModel):
     text: str
 
 @app.post("/predict_topic")
 async def predict_topic(data: TextData):
     """
-    Provide a JSON payload with a text snippet.
-    Returns the predicted topic and its probability using the trained model.
+    Predict the topic of a single text snippet.
     """
     if topic_model is None:
-        raise HTTPException(status_code=400, detail="Model not trained. Use /train_model first.")
+        raise HTTPException(400, "Model not trained. Use /train_model first.")
     try:
         topics, probs = topic_model.transform([data.text])
-        pred_topic = topics[0]
-        if pred_topic == -1:
-            pred_prob = 0.0
-        else:
-            pred_prob = float(probs[0][pred_topic])
-        return {"topic": int(pred_topic), "probability": pred_prob}
+        t = topics[0]
+        p = float(probs[0][t]) if t != -1 else 0.0
+        return {"topic": int(t), "probability": p}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction error: {e}")
+        raise HTTPException(500, f"Prediction error: {e}")
 
-# 5. Predict topics for an uploaded CSV file
+# -----------------------
+# 4) PREDICT TOPICS (CSV)
+# -----------------------
 @app.post("/predict_topics_csv")
 async def predict_topics_csv(file: UploadFile = File(...)):
     """
-    Upload a CSV file (with 'sentence_clean' or 'text' column) to get topic predictions.
-    Returns a CSV file with added 'predicted_topic' and 'probability' columns using the trained model.
+    Upload a CSV with 'text_clean' or 'text' column to get topic predictions.
+    Returns a CSV with 'predicted_topic' + 'probability' columns.
     """
     if topic_model is None:
-        raise HTTPException(status_code=400, detail="Model not trained. Use /train_model first.")
+        raise HTTPException(400, "Model not trained. Use /train_model first.")
     try:
         contents = await file.read()
         df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
-        if "sentence_clean" in df.columns:
-            text_column = "sentence_clean"
+
+        # We first look for "text_clean". If not found, fallback to "text"
+        if "text_clean" in df.columns:
+            text_column = "text_clean"
         elif "text" in df.columns:
             text_column = "text"
         else:
-            raise HTTPException(status_code=400, detail="CSV must contain a 'sentence_clean' or 'text' column.")
+            raise HTTPException(
+                400, "CSV must contain either 'text_clean' or 'text' column for prediction."
+            )
+
         texts = df[text_column].astype(str).tolist()
         topics, probs = topic_model.transform(texts)
         df["predicted_topic"] = topics
-        df["probability"] = probs.tolist()
+        df["probability"] = [list(prob_row) for prob_row in probs]
+
         output = io.StringIO()
         df.to_csv(output, index=False)
         output.seek(0)
@@ -325,143 +424,180 @@ async def predict_topics_csv(file: UploadFile = File(...)):
             headers={"Content-Disposition": "attachment; filename=predicted_topics.csv"}
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"CSV Prediction error: {e}")
+        raise HTTPException(500, f"CSV Prediction error: {e}")
 
-# 6. Visualize topics (interactive Plotly HTML)
+# -----------------------
+# 5) VISUALIZE TOPICS (PLOTLY)
+# -----------------------
 @app.get("/visualize_topics", response_class=HTMLResponse)
 async def visualize_topics():
     """
     Returns an interactive Plotly visualization of topics using the trained model.
     """
     if topic_model is None:
-        raise HTTPException(status_code=400, detail="Model not trained. Use /train_model first.")
+        raise HTTPException(400, "Model not trained. Use /train_model first.")
     try:
         fig = topic_model.visualize_topics()
-        html = fig.to_html(include_plotlyjs="cdn")
-        return HTMLResponse(content=html)
+        return HTMLResponse(fig.to_html(include_plotlyjs="cdn"))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Visualization error: {e}")
+        raise HTTPException(500, f"Visualization error: {e}")
 
-# 7. Visualize topic barchart (topic word representation)
+# -----------------------
+# 6) VISUALIZE BARCHART (PLOTLY)
+# -----------------------
 @app.get("/visualize_barchart", response_class=HTMLResponse)
 async def visualize_barchart():
     """
     Returns an interactive barchart of topic representations using the trained model.
     """
     if topic_model is None:
-        raise HTTPException(status_code=400, detail="Model not trained. Use /train_model first.")
+        raise HTTPException(400, "Model not trained. Use /train_model first.")
     try:
         fig = topic_model.visualize_barchart()
-        html = fig.to_html(include_plotlyjs="cdn")
-        return HTMLResponse(content=html)
+        return HTMLResponse(fig.to_html(include_plotlyjs="cdn"))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Barchart Visualization error: {e}")
+        raise HTTPException(500, f"Barchart Visualization error: {e}")
 
-# 8. Visualize topic hierarchy
+# -----------------------
+# 7) VISUALIZE HIERARCHY (PLOTLY)
+# -----------------------
 @app.get("/visualize_hierarchy", response_class=HTMLResponse)
 async def visualize_hierarchy():
     """
     Returns an interactive hierarchical visualization of topics using the training texts.
     """
     if topic_model is None or training_texts is None:
-        raise HTTPException(status_code=400, detail="Model not trained or training texts not available. Use /train_model first.")
+        raise HTTPException(400, "Model not trained or training texts not available. Use /train_model first.")
     try:
         hierarchical_topics = topic_model.hierarchical_topics(training_texts)
         fig = topic_model.visualize_hierarchy(hierarchical_topics=hierarchical_topics)
-        html = fig.to_html(include_plotlyjs="cdn")
-        return HTMLResponse(content=html)
+        return HTMLResponse(fig.to_html(include_plotlyjs="cdn"))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Hierarchy Visualization error: {e}")
+        raise HTTPException(500, f"Hierarchy Visualization error: {e}")
 
-# 9. Visualize documents (embedding visualization)
+# -----------------------
+# 8) VISUALIZE DOCUMENTS (PLOTLY)
+# -----------------------
 @app.get("/visualize_documents", response_class=HTMLResponse)
 async def visualize_documents():
     """
-    Returns an interactive visualization of document embeddings using the original texts (if available) or training texts.
+    Returns an interactive 2D visualization of document embeddings using
+    the original texts (if available) or training texts.
     """
     if topic_model is None:
-        raise HTTPException(status_code=400, detail="Model not trained. Use /train_model first.")
+        raise HTTPException(400, "Model not trained. Use /train_model first.")
     try:
-        texts_to_use = original_texts if original_texts is not None else training_texts
-        fig = topic_model.visualize_documents(texts_to_use)
-        html = fig.to_html(include_plotlyjs="cdn")
-        return HTMLResponse(content=html)
+        docs = original_texts if original_texts else training_texts
+        fig = topic_model.visualize_documents(docs)
+        return HTMLResponse(fig.to_html(include_plotlyjs="cdn"))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Documents Visualization error: {e}")
+        raise HTTPException(500, f"Documents Visualization error: {e}")
 
-# 10. Visualize overall topic distribution (for a given document index)
+# -----------------------
+# 9) VISUALIZE DISTRIBUTION (PLOTLY)
+# -----------------------
 @app.get("/visualize_distribution", response_class=HTMLResponse)
 async def visualize_distribution(doc_index: int = Query(0)):
     """
-    Returns an interactive visualization of the topic distribution for a given document.
-    (Uses the training probabilities stored during model training.)
+    Returns an interactive Plotly visualization of the topic distribution.
+    doc_index >= 0 => distribution for that doc
+    doc_index == -1 => average distribution across all docs
     """
-    if topic_model is None or training_texts is None:
-        raise HTTPException(status_code=400, detail="Model not trained or training texts not available. Use /train_model first.")
+    if topic_model is None or training_texts is None or training_probabilities is None:
+        raise HTTPException(400, "Model not trained or training texts/probabilities not available.")
     try:
-        # Ensure the doc_index is in range
-        if doc_index < 0 or doc_index >= len(training_texts):
-            raise HTTPException(status_code=400, detail="doc_index out of range.")
-        fig = topic_model.visualize_distribution(training_probabilities[doc_index])
-        html = fig.to_html(include_plotlyjs="cdn")
-        return HTMLResponse(content=html)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Distribution Visualization error: {e}")
+        if doc_index == -1:
+            # Average over all docs
+            all_probs = [p.toarray() if hasattr(p, "toarray") else p for p in training_probabilities]
+            overall_prob = np.mean(np.vstack(all_probs), axis=0)
+            fig = topic_model.visualize_distribution(overall_prob)
+        else:
+            if doc_index < 0 or doc_index >= len(training_texts):
+                raise HTTPException(400, "doc_index out of range.")
+            p = training_probabilities[doc_index]
+            if hasattr(p, "toarray"):
+                p = p.toarray()
+            fig = topic_model.visualize_distribution(p)
 
-# 11. Visualize article topic counts (matplotlib image)
+        return HTMLResponse(fig.to_html(include_plotlyjs="cdn"))
+    except Exception as e:
+        raise HTTPException(500, f"Distribution Visualization error: {e}")
+
+# -----------------------
+# 10) VISUALIZE ARTICLE COUNTS (MATPLOTLIB)
+# -----------------------
 @app.get("/visualize_article_counts")
 async def visualize_article_counts():
     """
-    Returns a PNG image of a stacked bar chart showing topic counts per article.
-    (For demonstration, using dummy filenames if not provided.)
+    Returns a PNG stacked bar chart showing topic counts per article.
+    Using top words in the legend via get_topic_label.
     """
+    import matplotlib.pyplot as plt
+    import io
+
+    if topic_model is None or training_texts is None:
+        raise HTTPException(400, "Model not trained or training texts not available.")
+
     try:
-        if topic_model is None or training_texts is None:
-            raise HTTPException(status_code=400, detail="Model not trained or training texts not available.")
         topics, _ = topic_model.transform(training_texts)
         dummy_filenames = ["Article"] * len(training_texts)
-        df_sim = pd.DataFrame({"filename": dummy_filenames, "topic_number": topics})
-        article_topic_counts = df_sim.groupby('filename')['topic_number'].value_counts().unstack(fill_value=0)
-        article_topic_counts.columns = [f'Topic {i}' for i in article_topic_counts.columns]
+        df_sim = pd.DataFrame({"File": dummy_filenames, "topic_number": topics})
+        article_topic_counts = df_sim.groupby("File")["topic_number"].value_counts().unstack(fill_value=0)
+
+        # Convert numeric IDs to labels
+        article_topic_counts.columns = [get_topic_label(c) for c in article_topic_counts.columns]
+
         plt.figure(figsize=(10, 6))
-        article_topic_counts.plot(kind='bar', stacked=True)
-        plt.title('Topic Distribution per Article (Count)')
-        plt.xlabel('Article')
-        plt.ylabel('Count')
+        article_topic_counts.plot(kind="bar", stacked=True)
+        plt.title("Topic Distribution per Article (Count)")
+        plt.xlabel("Article")
+        plt.ylabel("Count")
+
         buf = io.BytesIO()
         plt.savefig(buf, format="png")
         buf.seek(0)
         plt.close()
         return StreamingResponse(buf, media_type="image/png")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Article Counts Visualization error: {e}")
+        raise HTTPException(500, f"Article Counts Visualization error: {e}")
 
-# 12. Visualize article topic proportions (matplotlib image)
+# -----------------------
+# 11) VISUALIZE ARTICLE PROPORTIONS (MATPLOTLIB)
+# -----------------------
 @app.get("/visualize_article_proportions")
 async def visualize_article_proportions():
     """
-    Returns a PNG image of a stacked bar chart showing topic proportions per article.
+    Returns a PNG stacked bar chart showing topic proportions per article.
+    Using top words in the legend via get_topic_label.
     """
+    import matplotlib.pyplot as plt
+    import io
+
+    if topic_model is None or training_texts is None:
+        raise HTTPException(400, "Model not trained or training texts not available.")
+
     try:
-        if topic_model is None or training_texts is None:
-            raise HTTPException(status_code=400, detail="Model not trained or training texts not available.")
         topics, _ = topic_model.transform(training_texts)
         dummy_filenames = ["Article"] * len(training_texts)
-        df_sim = pd.DataFrame({"filename": dummy_filenames, "topic_number": topics})
-        article_topic_proportions = df_sim.groupby('filename')['topic_number'].value_counts(normalize=True).unstack(fill_value=0)
-        article_topic_proportions.columns = [f'Topic {i}' for i in article_topic_proportions.columns]
+        df_sim = pd.DataFrame({"File": dummy_filenames, "topic_number": topics})
+        article_topic_proportions = df_sim.groupby("File")["topic_number"].value_counts(normalize=True).unstack(fill_value=0)
+
+        # Convert numeric IDs to labels
+        article_topic_proportions.columns = [get_topic_label(c) for c in article_topic_proportions.columns]
+
         plt.figure(figsize=(10, 6))
-        article_topic_proportions.plot(kind='bar', stacked=True)
-        plt.title('Topic Distribution per Article (Proportion)')
-        plt.xlabel('Article')
-        plt.ylabel('Proportion')
+        article_topic_proportions.plot(kind="bar", stacked=True)
+        plt.title("Topic Distribution per Article (Proportion)")
+        plt.xlabel("Article")
+        plt.ylabel("Proportion")
+
         buf = io.BytesIO()
         plt.savefig(buf, format="png")
         buf.seek(0)
         plt.close()
         return StreamingResponse(buf, media_type="image/png")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Article Proportions Visualization error: {e}")
+        raise HTTPException(500, f"Article Proportions Visualization error: {e}")
 
 # -----------------------
 # RUN THE APPLICATION

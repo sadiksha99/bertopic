@@ -1,97 +1,96 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# # 1. Import Necessary Libraries
-# 
-# Make sure  Microsoft Visual C++ is installed on your pc
-# 
-# Extracting text from pdf and converting to csv
-
-# In[3]:
-
-
-import fitz  # PyMuPDF
-import os
+from fastapi import FastAPI, HTTPException, File, UploadFile, Query
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from pydantic import BaseModel
+import uvicorn
 import pandas as pd
+import io
+import os
 import re
+from collections import Counter
+import fitz  # PyMuPDF
+import nltk
+from wordsegment import load, segment
+import spacy
+import unicodedata
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer, PorterStemmer
+from nltk import download
+import numpy as np
+from typing import List
+import zipfile
+import tempfile
+import plotly.express as px
+import matplotlib.pyplot as plt
+import nbformat
+from nbconvert import PythonExporter
 
-# Path to your directory containing the PDFs
-doc_dir = r'C:\Users\sadik\OneDrive\Documenten\Howest\semester6\AI_project\studies\studies'
+# -----------------------
+# DOWNLOAD AND LOAD RESOURCES
+# -----------------------
+nltk.download('punkt')
+download('wordnet')
+download('stopwords')
 
-# List to store the blocks of text (as individual records)
-data = []
+load()  # Load wordsegment model
+nlp = spacy.load("en_core_web_sm")
+stop_words = set(stopwords.words('english'))
 
-# Function to check if a line is a heading (all uppercase or starts with 'CHAPTER')
-def is_heading(line):
+# Define the set of important stopwords to retain:
+important_stopwords = {
+    "not", "never", "nor", "no",
+    "can", "could", "should", "would", "may", "might", "must",
+    "all", "any", "some", "many", "much", "few", "more", "most", "several", "less", "least",
+    "before", "after", "since", "until", "while", "when", "then",
+    "than", "as", "like"
+}
+
+lemmatizer = WordNetLemmatizer()
+stemmer = PorterStemmer()
+
+# Global variables for topic modeling
+topic_model = None
+training_texts = None       # Cleaned texts used for training
+original_texts = None       # Original texts (if available) for document visualization
+training_probabilities = None  # Stored probabilities from training
+
+# -----------------------
+# EXTRACTION FUNCTIONS (Using PyMuPDF)
+# -----------------------
+
+def is_heading(line: str) -> bool:
     return line.isupper() or line.startswith('CHAPTER')
 
-# Function to check if a line is a footnote (starts with number in brackets, number, or asterisk)
-def is_footnote(line):
-    return re.match(r'^\[\d+\]', line) or re.match(r'^\d+\.', line) or line.startswith('*') or line.startswith('Note') or line.startswith('Table') 
+def is_footnote(line: str) -> bool:
+    return re.match(r'^\[\d+\]', line) or re.match(r'^\d+\.', line) or line.startswith('*') or line.startswith('Note') or line.startswith('Table')
 
-# Function to count words in a block of text
-def count_words(text):
+def count_words(text: str) -> int:
     return len(text.split())
 
-# Function to filter out lines containing DOI, URLs, specific keywords, or phrases
-def contains_doi_or_https(line):
+def contains_doi_or_https(line: str) -> bool:
     return ('doi' in line.lower() or 
             'https' in line.lower() or 
             'http' in line.lower() or 
             'journal' in line.lower() or 
-            'university' in line.lower() or 
-            'brookville' in line.lower() or
-            'to cite this article' in line.lower() or
-            'full terms & conditions' in line.lower() or
-            'taylor & francis' in line.lower() or
-            'elsevier' in line.lower() or
-            'published by' in line.lower() or
-            'received' in line.lower() or
-            'revised' in line.lower() or
-            'author(s)' in line.lower() or
-            'source:' in line.lower() or
-            'history:' in line.lower() or
-            'keywords' in line.lower() or
-            'vol.' in line.lower() or 
-            'volume' in line.lower() or 
-            'downloaded' in line.lower() or    
-            'article' in line.lower() or
-            'creative commons use' in line.lower() or
-            'author' in line.lower() or 
-            'copyrighted' in line.lower() or
-            'quarterly' in line.lower() or
-            'journal' in line.lower() or
-            'purtell' in line.lower() or
-            'resources:' in line.lower() or
-            'publisher' in line.lower() or
-            'ying' in line.lower() or
-            'cincinnati' in line.lower() or
-            'ISSN' in line.lower() or
-            'All rights reserved' in line.lower() or
-            'authors' in line.lower())
+            'university' in line.lower())
 
-# Function to check if a line is part of the reference or acknowledgements section
-def is_reference_or_acknowledgements_section(line):
-    reference_markers = ['references', 'bibliography', 'acknowledgements', 'nederlandse', 'method',"methods"]
-    return any(marker in line.lower() for marker in reference_markers)
+def is_reference_or_acknowledgements_section(line: str) -> bool:
+    markers = ['references', 'bibliography', 'acknowledgements', 'nederlandse', 'method', "methods"]
+    return any(marker in line.lower() for marker in markers)
 
-# Function to replace ligatures with their individual characters
-def replace_ligatures(text):
+def replace_ligatures(text: str) -> str:
     ligatures = {
         'ﬁ': 'fi',
         'ﬂ': 'fl',
         'ﬃ': 'ffi',
         'ﬄ': 'ffl',
-        'ﬀ': 'ff',
-        'ﬂ': 'fl',
+        'ﬀ': 'ff'
     }
-    for ligature, replacement in ligatures.items():
-        text = text.replace(ligature, replacement)
+    for lig, repl in ligatures.items():
+        text = text.replace(lig, repl)
     return text
 
-# Function to fix common word splits
-def fix_common_word_splits(text):
-    common_fixes = {
+def fix_common_word_splits(text: str) -> str:
+    fixes = {
         'signi ficant': 'significant',
         'di fferent': 'different',
         'e ffective': 'effective',
@@ -100,561 +99,390 @@ def fix_common_word_splits(text):
         'e ff ective': 'effective',
         'con fi dence': 'confidence',
     }
-    for split_word, correct_word in common_fixes.items():
-        text = text.replace(split_word, correct_word)
-    
-    text = re.sub(r'\b(\w{3,})\s+(\w{3,})\b', r'\1 \2', text)  # Adjust spaces if needed
+    for split_word, correct in fixes.items():
+        text = text.replace(split_word, correct)
+    text = re.sub(r'\b(\w{3,})\s+(\w{3,})\b', r'\1 \2', text)
     return text
 
-# Loop through each file in the directory
-for filename in os.listdir(doc_dir):
-    if filename.endswith('.pdf'):  # Only process PDF files
-        file_path = os.path.join(doc_dir, filename)
-
-        # Extract the title of the PDF (filename without the '.pdf' extension)
-        title = os.path.splitext(filename)[0]
-
-        # Open the PDF file using PyMuPDF
-        pdf_document = fitz.open(file_path)
-
-        # Flag to indicate if we are in the reference or acknowledgements section for the entire document
-        section_reached = False
-
-        # Iterate through each page in the PDF
-        for page_num in range(pdf_document.page_count):
-            if section_reached:
-                break  # Stop processing further pages if the section marker was reached
-
-            page = pdf_document.load_page(page_num)  # Load a page by page number
-            text_dict = page.get_text("dict")  # Extract text in dictionary format to preserve layout
-            
-            # Substitute all semicolons (;) with commas (,)
-            for block in text_dict["blocks"]:
-                if block["type"] == 0:  # Type 0 is a text block
-                    for line in block["lines"]:
-                        for span in line["spans"]:
-                            span["text"] = span["text"].replace(';', ',')
-            
-            # Process each block of text on the page
-            for block in text_dict["blocks"]:
-                if block["type"] == 0:  # Type 0 is a text block
-                    block_text = ""
-                    prev_x = None  # To store the previous x-coordinate (indentation level)
-                    paragraph = []  # List to store lines that belong to the same paragraph
-
-                    for line in block["lines"]:
-                        # Get the text from the line
-                        line_text = " ".join([span["text"] for span in line["spans"]])
-
-                        # Apply ligature replacement and common word fixes
-                        line_text = replace_ligatures(line_text)
-                        line_text = fix_common_word_splits(line_text)
-
-                        # **Immediately stop processing if the reference/acknowledgements section is detected**
-                        if is_reference_or_acknowledgements_section(line_text):
-                            section_reached = True
-                            break  # Exit the inner loop and stop processing this file
-                        
-                        # Skip if it's a header, footnote, contains DOI/URL, or matches the title of the PDF
-                        if is_heading(line_text) or is_footnote(line_text) or contains_doi_or_https(line_text) or line_text.strip().lower() == title.lower():
-                            continue
-
-                        # Get the x-coordinate (horizontal position of the first word in the line)
-                        first_word_x = line["spans"][0]["bbox"][0]
-
-                        # Check if the line belongs to the same paragraph (by horizontal position)
-                        if prev_x is None or first_word_x - prev_x < 10:  # If the line's x is close to the previous, it's part of the same paragraph
-                            paragraph.append(line_text)
-                        else:
-                            # When indentation changes significantly, treat this as the start of a new paragraph
-                            if paragraph:  # If there's already accumulated text, store it as a block
-                                full_paragraph_text = " ".join(paragraph).strip()
-                                if count_words(full_paragraph_text) >= 10:  # Skip blocks with less than 10 words
-                                    data.append([filename, page_num + 1, full_paragraph_text])
-                            paragraph = [line_text]  # Start a new paragraph
-
-                        prev_x = first_word_x  # Update the previous x-coordinate
-
-                    # If section_reached is True after breaking, break the outer loop as well
-                    if section_reached:
+def extract_text_from_pdf_fitz(pdf_path: str):
+    """
+    Extracts paragraphs from a PDF using PyMuPDF with custom cleaning.
+    Returns a list of records: [File, Page, text].
+    """
+    data = []
+    doc = fitz.open(pdf_path)
+    filename = os.path.basename(pdf_path)
+    section_reached = False
+    for page_num in range(doc.page_count):
+        if section_reached:
+            break
+        page = doc.load_page(page_num)
+        text_dict = page.get_text("dict")
+        # Replace semicolons with commas in spans
+        for block in text_dict["blocks"]:
+            if block["type"] == 0:
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        span["text"] = span["text"].replace(';', ',')
+        for block in text_dict["blocks"]:
+            if block["type"] == 0:
+                paragraph = []
+                prev_x = None
+                for line in block["lines"]:
+                    line_text = " ".join([span["text"] for span in line["spans"]])
+                    line_text = replace_ligatures(line_text)
+                    line_text = fix_common_word_splits(line_text)
+                    if is_reference_or_acknowledgements_section(line_text):
+                        section_reached = True
                         break
+                    if is_heading(line_text) or is_footnote(line_text) or contains_doi_or_https(line_text) or line_text.strip().lower() == filename.lower():
+                        continue
+                    first_word_x = line["spans"][0]["bbox"][0]
+                    if prev_x is None or abs(first_word_x - prev_x) < 10:
+                        paragraph.append(line_text)
+                    else:
+                        if paragraph and count_words(" ".join(paragraph)) >= 10:
+                            data.append([filename, page_num + 1, " ".join(paragraph).strip()])
+                        paragraph = [line_text]
+                    prev_x = first_word_x
+                if paragraph and not section_reached and count_words(" ".join(paragraph)) >= 10:
+                    data.append([filename, page_num + 1, " ".join(paragraph).strip()])
+    return data
 
-                    # If there's any accumulated paragraph, add it to the data
-                    if paragraph and not section_reached:
-                        full_paragraph_text = " ".join(paragraph).strip()
-                        if count_words(full_paragraph_text) >= 10:  # Skip blocks with less than 10 words
-                            data.append([filename, page_num + 1, full_paragraph_text])
+# -----------------------
+# CLEANING FUNCTIONS FOR CSV DATA
+# -----------------------
 
-# Convert the data to a DataFrame (optional)
-df = pd.DataFrame(data, columns=["File", "Page", "text"])
-
-# Print the first few records
-print(df.head())
-
-
-# In[4]:
-
-
-# save the DataFrame to a CSV file
-df.to_csv("studies_lobke.csv", index=False)
-
-
-# # 2.  Load Your Data
-# 
-# Load the articles from your CSV file using pandas. 
-
-# In[33]:
-
-
-import pandas as pd
-
-# Load the data
-df= pd.read_csv(r'C:\Users\sadik\OneDrive\Documenten\Howest\semester6\AI_project\project\studies_lobke.csv')
-df.head()
-
-
-# ### Removing any personal informtion to anonymize data  
-
-# In[34]:
-
-
-import spacy
-import re
-import pandas as pd
-
-# Load spaCy model for Named Entity Recognition (NER)
-nlp = spacy.load("en_core_web_sm")
-
-# Function to remove personal names, dates, and numbers
-def remove_sensitive_info(text):
+def remove_sensitive_info(text: str) -> str:
     if not isinstance(text, str):
-        return ""  # Handle non-string values
-
+        return ""
     doc = nlp(text)
-
-    # Remove PERSON names using spaCy NER
     words = [token.text for token in doc if token.ent_type_ != "PERSON"]
-
-    # Remove dates and numbers
     cleaned_text = " ".join(words)
-    cleaned_text = re.sub(r'\b\d{1,4}[-/]\d{1,2}[-/]\d{1,4}\b', '', cleaned_text)  # Remove dates (YYYY-MM-DD, DD/MM/YYYY)
-    cleaned_text = re.sub(r'\b\d+\b', '', cleaned_text)  # Remove standalone numbers
-
+    cleaned_text = re.sub(r'\b\d{1,4}[-/]\d{1,2}[-/]\d{1,4}\b', '', cleaned_text)
+    cleaned_text = re.sub(r'\b\d+\b', '', cleaned_text)
     return cleaned_text.strip()
 
-# Apply function to remove names, personal info, dates, and numbers from df['sentence_clean']
-df['text_clean'] = df['text'].apply(remove_sensitive_info)
-
-# Display cleaned dataframe
-display(df.head())
-
-
-# # 3. Prepare Your Text Data
-# We clean up the text
-# - Remove the name of city, country, geography for better outcome
-# - Remove special characters (only letters)
-# - Convert to lower case
-# - Remove stop words
-# - Remove words of only one or 2 letters ('a', 'I', at,...)
-# - Remove very short sentences
-# - Remove urls 
-# - use stemming
-# - do duplicate sentences
-# 
-# 
-# 
-
-# In[35]:
-
-
-import spacy
-import pandas as pd
-
-# Load spaCy's English NER model
-nlp = spacy.load("en_core_web_sm")
-
-# Function to remove geographic entities (cities, countries, locations)
-def remove_geographical_entities(text):
+def remove_geographical_entities(text: str) -> str:
     if not isinstance(text, str):
-        return ""  # Handle missing or non-string values
-    
+        return ""
     doc = nlp(text)
     filtered_tokens = [token.text for token in doc if token.ent_type_ not in ["GPE", "LOC", "FAC"]]
-    
     return " ".join(filtered_tokens)
 
-# Apply function to remove cities, countries, and geography
-df['text_clean'] = df['text'].apply(remove_geographical_entities)
-
-# Display a few cleaned sentences
-df.head()
-
-
-# In[36]:
-
-
-import re
-import unicodedata
-import pandas as pd
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer, PorterStemmer
-from nltk import download
-from collections import Counter
-
-# Ensure necessary NLTK resources are downloaded
-download('wordnet')
-download('stopwords')
-
-# Load stopwords
-stop_words = set(stopwords.words('english'))
-
-# Retain important stopwords (do NOT remove these)
-important_stopwords = {
-    # Negation Words (Critical for meaning)
-    "not", "never", "nor", "no",
-    # Modality Words (Possibility/Necessity)
-    "can", "could", "should", "would", "may", "might", "must",
-    # Quantifiers (Define amounts)
-    "all", "any", "some", "many", "much", "few", "more", "most", "several", "less", "least",
-    # Time References (Useful for context)
-    "before", "after", "since", "until", "while", "when", "then",
-    # Comparative Words (Relative meaning)
-    "than", "as", "like"
-}
-# Remove all stopwords **except** the important ones
-stop_words -= important_stopwords
-
-# Minimum word length threshold
-minWordSize = 2
-
-# Initialize the WordNetLemmatizer and PorterStemmer
-lemmatizer = WordNetLemmatizer()
-stemmer = PorterStemmer()
-
-# Preprocessing function to clean sentences
-def preprocess_text(text):
+def preprocess_text(text: str) -> str:
     if not isinstance(text, str):
-        return ""  # Handle missing or non-string values
-
-    # Normalize Unicode characters
+        return ""
+    text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
     text = unicodedata.normalize('NFKD', text)
-
-    # Convert text to lowercase and split into words
+    text = re.sub(r'[^a-zA-Z\s]', ' ', text)
     words = text.lower().split()
-
-    # Remove stopwords except for retained important ones
-    filtered_words = [word for word in words if word not in stop_words]
-
-    # Apply lemmatization
+    filtered_words = [word for word in words if not (word in stop_words and word not in important_stopwords)]
     lemmatized_words = [lemmatizer.lemmatize(word) for word in filtered_words]
-
-    # Apply stemming after lemmatization
     stemmed_words = [stemmer.stem(word) for word in lemmatized_words]
-
-    # Remove short words after stopword removal, except retained important words
-    final_words = [w for w in stemmed_words if len(w) >= minWordSize or w in important_stopwords]
-
-    # Remove duplicate words within each sentence (preserving order)
+    final_words = [w for w in stemmed_words if len(w) >= 4]
     unique_words = list(dict.fromkeys(final_words))
-
-    # Ensure proper spacing between words
     return " ".join(unique_words)
 
-# Apply preprocessing function to clean sentences
-df['text_clean'] = df['text_clean'].apply(preprocess_text)
-
-# Display the first elements after processing
-df.head()
-
-
-# In[38]:
-
-
-df.info()
-
-
-# ### To see how data cleaning looks 
-
-# In[39]:
-
-
-import os
-
-# Define the filename for the cleaned data
-output_filename = "cleaned_data.csv"
-
-# Get the current folder path
-current_folder = os.getcwd()
-
-# Full path to save the file
-output_path = os.path.join(current_folder, output_filename)
-
-# Save the cleaned DataFrame to CSV
-df.to_csv(output_path, index=False, encoding='utf-8')
-
-print(f"✅ Cleaned data saved at: {output_path}")
-
-
-# ### Read the clean data 
-
-# In[40]:
-
-
-import pandas as pd
-
-# Load the data
-df= pd.read_csv(r'C:\Users\sadik\OneDrive\Documenten\Howest\semester6\AI_project\project\cleaned_data.csv')
-df.head()
-
-
-# # 4. Initialize and Fit BERTopic
-# The good thing with BERTopic is that is does most of the work automatically (Meaning, I do not need to bore you to death with details about how it works behind te scenes.)
-# 
-# We need to do 3 things
-# 1. Initialize BERTopic model
-# 2. 'Fit' the model -> this  means: run the model, as you would run a simple linear regression
-# 3. Look at the topics via 
-# 
-# To get started, let's just use the default settings.
-
-# In[41]:
-
-
-from bertopic import BERTopic
-from sklearn.feature_extraction.text import TfidfVectorizer
-
-# Initialize BERTopic model
-topic_model = BERTopic(calculate_probabilities=True)
-
-# Fit the model with preprocessed text sentences
-topics, probabilities = topic_model.fit_transform(df['text_clean'])
-
-# View and inspect topics
-topic_model.get_topic_info()
-
-
-# In[43]:
-
-
-# Initialize BERTopic model
-topic_model = BERTopic(calculate_probabilities=True, min_topic_size=5, nr_topics=10)
-
-# Fit the model with preprocessed text sentences
-topics, probabilities = topic_model.fit_transform(df['text_clean'])
-
-# View and inspect topics
-topic_model.get_topic_info()
-
-
-
-# In[44]:
-
-
-topic_model.topics_[:20]
-
-
-# ### Here we reduce the number of topics with the number of pdf files we have uploaded
-
-# In[45]:
-
-
-print(topic_model.topics_)
-
-
-# ### Here we can search an attribute that is related to certain topics
-
-# In[46]:
-
-
-similar_topics, similarity = topic_model.find_topics("stress"); similar_topics
-
-
-# In[47]:
-
-
-similar_topics, similarity = topic_model.find_topics("happy"); similar_topics
-
-
-# In[49]:
-
-
-topic_model.get_topic(6)
-
-
-# ### topic limited to the pdf count
-
-# In[50]:
-
-
-topic_model.get_topic(30)
-
-
-# # 5. Visualize Topics
-# We can call .visualize_topics to create a 2D representation of the topics. The  graph is a plotly interactive graph which can be converted to HTML:
-# 
-# Note: If you get the error 'ValueError: Mime type rendering requires nbformat>=4.2.0 but it is not installed', go to terminal and type 'pip install --upgrade nbformat  ' 
-
-# In[51]:
-
-
-# Visualize topics with an interactive plot
-topic_model.visualize_topics()
-
-
-# You can use the slider to select the topic which then lights up red. If you hover over a topic, then general information is given about the topic, including the size of the topic and its corresponding words.
-# 
-# We can also ask for a representation of the corresponding words for each topic:
-
-# In[52]:
-
-
-topic_model.visualize_barchart()
-
-
-# # 6. Visualize Topic Hierarchy¶
-# The topics that were created can be hierarchically reduced. In order to understand the potential hierarchical structure of the topics, we can use scipy.cluster.hierarchy to create clusters and visualize how they relate to one another. We can also see what happens to the topic representations when merging topics. 
-
-# In[54]:
-
-
-hierarchical_topics = topic_model.hierarchical_topics(df['text_clean'])
-topic_model.visualize_hierarchy(hierarchical_topics=hierarchical_topics)
-
-
-# If you hover over the black circles, you will see the topic representation at that level of the hierarchy. These representations help you understand the effect of merging certain topics. Some might be logical to merge whilst others might not. Moreover, we can now see which sub-topics can be found within certain larger themes.
-# 
-# You can also print a text-version of the topic representation at the different levels (a bit less pretty, but maybe easier to read.)
-
-# In[46]:
-
-
-tree = topic_model.get_topic_tree(hierarchical_topics)
-print(tree)
-
-
-# # 7. Visualize documents
-# 
-# We can visualize the documents (=texts) inside the topics to see if they were assigned correctly or whether they make sense. To do so, we can use the topic_model.visualize_documents() function. This function recalculates the document embeddings and reduces them to 2-dimensional space for easier visualization purposes. 
-
-# In[56]:
-
-
-df = df.reset_index(drop=True)  # Reset index to avoid KeyError
-topic_model.visualize_documents(df['text'].tolist())  # Convert Series to list
-
-
-# When you hover over a point, you can see which text it is. The color tells you to which topic it belongs. While this is very pretty, it might be useful to be able to just open an excel-file or csv, which contains the original text, with the assigned topic, including the topic words:
-
-# In[57]:
-
-
-import numpy as np
-# Add topics and probabilities to the original DataFrame
-df["topic_number"] = np.argmax(probabilities, axis=1)
-
-# Also extract the topic names and assign them to the DataFrame
-info = topic_model.get_topic_info()
-topic_names = info['Representation']
-
-df['topic_name'] = df['topic_number'].map(topic_names)
-
-# Save the updated DataFrame to a CSV
-
-df['topic_name'] = df['topic_number'].map(topic_names)
-
-# Save to a new CSV file
-df.to_csv("studies_lobke_with_topics.csv", index=False)
-
-
-# In[58]:
-
-
-df.head()
-
-
-# We can also see the topic distribution per document = the probability that the text belongs to each topic (if a topic is not included in the graph, the probability is 0). Eg, the topic distribution for the sixth document:(!python starts counting at 0, so 6th =5)
-
-# In[60]:
-
-
-topic_model.visualize_distribution(probabilities[5])
-
-
-# # 8. Topics per full article
-# 
-# We extract the number of times a topic is assigned within the full articles.
-
-# In[62]:
-
-
-import matplotlib.pyplot as plt
-
-# Calculate the count of times each topic is chosen within each article
-article_topic_counts = df.groupby('File')['topic_number'].value_counts().unstack(fill_value=0)
-
-# Rename columns to 'Topic X'
-article_topic_counts.columns = [f'Topic {i}' for i in article_topic_counts.columns]
-
-# Display the table
-print(article_topic_counts)
-
-# Plot the distribution for each article
-article_topic_counts.plot(kind='bar', stacked=True, figsize=(15, 7))
-plt.title('Topic Distribution per Article (Count)')
-plt.xlabel('Article')
-plt.ylabel('Count')
-plt.legend(title='Topics', bbox_to_anchor=(1.05, 1), loc='upper left')
-plt.show()
-
-
-# We could also do the same, but with proportions in stead of counts.
-
-# In[63]:
-
-
-import matplotlib.pyplot as plt
-
-# Calculate the proportion of times each topic is chosen within each article
-article_topic_proportions = df.groupby('File')['topic_number'].value_counts(normalize=True).unstack(fill_value=0)
-
-# Rename columns to 'Topic X'
-article_topic_proportions.columns = [f'Topic {i}' for i in article_topic_proportions.columns]
-
-# Display the table
-print(article_topic_proportions)
-
-# Plot the distribution for each article
-article_topic_proportions.plot(kind='bar', stacked=True, figsize=(15, 7))
-plt.title('Topic Distribution per Article (Proportion)')
-plt.xlabel('Article')
-plt.ylabel('Proportion')
-plt.legend(title='Topics', bbox_to_anchor=(1.05, 1), loc='upper left')
-plt.show()
-
-
-#  The highest related topic is child_classroom_behavior it makes sense because we are working with data to see how childeren change of what effects the psychology of child after finishing the elementary school and entering to high school.
-
-# In[63]:
-
-
-import nbformat
-from nbconvert import PythonExporter
-
-# Replace 'YourNotebookName.ipynb' with the actual filename of your notebook.
-notebook_filename = "BERTtopic.ipynb"  
-output_filename = notebook_filename.replace(".ipynb", ".py")
-
-# Read the notebook file
-with open(notebook_filename, encoding="utf-8") as f:
-    nb_node = nbformat.read(f, as_version=4)
-
-# Use PythonExporter to convert the notebook to a Python script
-python_exporter = PythonExporter()
-(script, resources) = python_exporter.from_notebook_node(nb_node)
-
-# Write the converted Python code to a .py file
-with open(output_filename, "w", encoding="utf-8") as f:
-    f.write(script)
-
-print(f"Notebook has been saved as {output_filename}")
-
+# -----------------------
+# FASTAPI SETUP
+# -----------------------
+app = FastAPI(
+    title="PDF/CSV to BERTopic API",
+    description="Upload files until model training. After that, use prediction and visualization endpoints without file uploads."
+)
+
+# -----------------------
+# API ENDPOINTS
+# -----------------------
+
+# Endpoint 1: Combined extraction and cleaning from PDFs
+@app.post("/extract_clean")
+async def extract_clean(files: List[UploadFile] = File(...), download: bool = Query(True)):
+    """
+    Upload one or more PDF files or a ZIP file containing PDFs.
+    Extracts text using PyMuPDF and then cleans the text using cleaning functions.
+    Returns a CSV file with columns: File, Page, text, and text_clean.
+    Set download=true to force CSV download; otherwise, returns JSON.
+    """
+    try:
+        all_rows = []
+        for file in files:
+            if file.filename.lower().endswith(".zip"):
+                with tempfile.TemporaryDirectory() as tmpdirname:
+                    zip_path = os.path.join(tmpdirname, file.filename)
+                    with open(zip_path, "wb") as f:
+                        f.write(await file.read())
+                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        zip_ref.extractall(tmpdirname)
+                    for root, _, filenames in os.walk(tmpdirname):
+                        for fname in filenames:
+                            if fname.lower().endswith(".pdf"):
+                                pdf_path = os.path.join(root, fname)
+                                extracted = extract_text_from_pdf_fitz(pdf_path)
+                                all_rows.extend([{"File": r[0], "Page": r[1], "text": r[2]} for r in extracted])
+            elif file.filename.lower().endswith(".pdf"):
+                contents = await file.read()
+                temp_path = f"temp_{file.filename}"
+                with open(temp_path, "wb") as f:
+                    f.write(contents)
+                extracted = extract_text_from_pdf_fitz(temp_path)
+                all_rows.extend([{"File": r[0], "Page": r[1], "text": r[2]} for r in extracted])
+                os.remove(temp_path)
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}")
+        df = pd.DataFrame(all_rows)
+        df["text_clean"] = df["text"].apply(remove_sensitive_info)
+        df["text_clean"] = df["text_clean"].apply(remove_geographical_entities)
+        df["text_clean"] = df["text_clean"].apply(preprocess_text)
+        if download:
+            output = io.StringIO()
+            df.to_csv(output, index=False)
+            output.seek(0)
+            return StreamingResponse(
+                output,
+                media_type="text/csv",
+                headers={"Content-Disposition": "attachment; filename=extracted_cleaned_texts.csv"}
+            )
+        else:
+            return {"extracted_cleaned_texts": df.to_dict(orient="records")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Extract and Clean error: {e}")
+
+# Endpoint 2: Train BERTopic model from a cleaned CSV file
+@app.post("/train_model")
+async def train_model(file: UploadFile = File(...)):
+    """
+    Upload a cleaned CSV file (with 'text_clean' or 'text' column) to train a BERTopic model.
+    The model, training texts, and original texts (if available) are stored globally.
+    """
+    global topic_model, training_texts, original_texts, training_probabilities
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
+        if "text_clean" in df.columns:
+            text_column = "text_clean"
+        elif "text" in df.columns:
+            text_column = "text"
+        else:
+            raise HTTPException(status_code=400, detail="CSV must contain a 'text_clean' or 'text' column.")
+        training_texts = df[text_column].astype(str).tolist()
+        if "text" in df.columns:
+            original_texts = df["text"].astype(str).tolist()
+        else:
+            original_texts = training_texts
+        from bertopic import BERTopic
+        # Use nr_topics=20 to get a maximum of 20 topics
+        topic_model = BERTopic(calculate_probabilities=True, min_topic_size=5, nr_topics=20)
+        topics, training_probabilities = topic_model.fit_transform(training_texts)
+        info = topic_model.get_topic_info().to_dict(orient="records")
+        return {"detail": "Model trained successfully", "topic_info": info}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Model Training error: {e}")
+
+# Endpoint 3: Predict topic for a single text input
+class TextData(BaseModel):
+    text: str
+
+@app.post("/predict_topic")
+async def predict_topic(data: TextData):
+    """
+    Provide a JSON payload with a text snippet.
+    Returns the predicted topic and its probability using the trained model.
+    """
+    if topic_model is None:
+        raise HTTPException(status_code=400, detail="Model not trained. Use /train_model first.")
+    try:
+        topics, probs = topic_model.transform([data.text])
+        pred_topic = topics[0]
+        if pred_topic == -1:
+            pred_prob = 0.0
+        else:
+            pred_prob = float(probs[0][pred_topic])
+        return {"topic": int(pred_topic), "probability": pred_prob}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction error: {e}")
+
+# Endpoint 4: Predict topics for an uploaded CSV file
+@app.post("/predict_topics_csv")
+async def predict_topics_csv(file: UploadFile = File(...)):
+    """
+    Upload a CSV file (with 'text_clean' or 'text' column) to get topic predictions.
+    Returns a CSV file with added 'predicted_topic' and 'probability' columns using the trained model.
+    """
+    if topic_model is None:
+        raise HTTPException(status_code=400, detail="Model not trained. Use /train_model first.")
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
+        if "text_clean" in df.columns:
+            text_column = "text_clean"
+        elif "text" in df.columns:
+            text_column = "text"
+        else:
+            raise HTTPException(status_code=400, detail="CSV must contain a 'text_clean' or 'text' column.")
+        texts = df[text_column].astype(str).tolist()
+        topics, probs = topic_model.transform(texts)
+        df["predicted_topic"] = topics
+        df["probability"] = probs.tolist()
+        output = io.StringIO()
+        df.to_csv(output, index=False)
+        output.seek(0)
+        return StreamingResponse(
+            output,
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=predicted_topics.csv"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"CSV Prediction error: {e}")
+
+# Endpoint 5: Visualize topics (Plotly interactive)
+@app.get("/visualize_topics", response_class=HTMLResponse)
+async def visualize_topics():
+    """
+    Returns an interactive Plotly visualization of topics using the trained model.
+    """
+    if topic_model is None:
+        raise HTTPException(status_code=400, detail="Model not trained. Use /train_model first.")
+    try:
+        fig = topic_model.visualize_topics()
+        html = fig.to_html(include_plotlyjs="cdn")
+        return HTMLResponse(content=html)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Visualization error: {e}")
+
+# Endpoint 6: Visualize topic barchart (Plotly interactive)
+@app.get("/visualize_barchart", response_class=HTMLResponse)
+async def visualize_barchart():
+    """
+    Returns an interactive barchart of topic representations using the trained model.
+    """
+    if topic_model is None:
+        raise HTTPException(status_code=400, detail="Model not trained. Use /train_model first.")
+    try:
+        fig = topic_model.visualize_barchart()
+        html = fig.to_html(include_plotlyjs="cdn")
+        return HTMLResponse(content=html)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Barchart Visualization error: {e}")
+
+# Endpoint 7: Visualize topic hierarchy (Plotly interactive)
+@app.get("/visualize_hierarchy", response_class=HTMLResponse)
+async def visualize_hierarchy():
+    """
+    Returns an interactive hierarchical visualization of topics using the training texts.
+    """
+    if topic_model is None or training_texts is None:
+        raise HTTPException(status_code=400, detail="Model not trained or training texts not available. Use /train_model first.")
+    try:
+        hierarchical_topics = topic_model.hierarchical_topics(training_texts)
+        fig = topic_model.visualize_hierarchy(hierarchical_topics=hierarchical_topics)
+        html = fig.to_html(include_plotlyjs="cdn")
+        return HTMLResponse(content=html)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Hierarchy Visualization error: {e}")
+
+# Endpoint 8: Visualize documents (Plotly interactive)
+@app.get("/visualize_documents", response_class=HTMLResponse)
+async def visualize_documents():
+    """
+    Returns an interactive visualization of document embeddings using the original texts (if available) or training texts.
+    """
+    if topic_model is None:
+        raise HTTPException(status_code=400, detail="Model not trained. Use /train_model first.")
+    try:
+        texts_to_use = original_texts if original_texts is not None else training_texts
+        fig = topic_model.visualize_documents(texts_to_use)
+        html = fig.to_html(include_plotlyjs="cdn")
+        return HTMLResponse(content=html)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Documents Visualization error: {e}")
+
+# Endpoint 9: Visualize overall topic distribution (Plotly interactive)
+@app.get("/visualize_distribution", response_class=HTMLResponse)
+async def visualize_distribution(doc_index: int = Query(0)):
+    """
+    Returns an interactive Plotly visualization of the topic distribution.
+    If doc_index >= 0, displays the distribution for that document.
+    If doc_index is -1, aggregates (averages) probabilities across all documents.
+    """
+    if topic_model is None or training_texts is None or training_probabilities is None:
+        raise HTTPException(status_code=400, detail="Model not trained or training texts/probabilities not available. Use /train_model first.")
+    try:
+        if doc_index == -1:
+            # Aggregate overall probabilities by converting to dense if needed
+            all_probs = [prob.toarray() if hasattr(prob, "toarray") else prob for prob in training_probabilities]
+            overall_prob = np.mean(np.vstack(all_probs), axis=0)
+            fig = topic_model.visualize_distribution(overall_prob)
+        else:
+            if doc_index < 0 or doc_index >= len(training_texts):
+                raise HTTPException(status_code=400, detail="doc_index out of range.")
+            prob = training_probabilities[doc_index]
+            if hasattr(prob, "toarray"):
+                prob = prob.toarray()
+            fig = topic_model.visualize_distribution(prob)
+        html = fig.to_html(include_plotlyjs="cdn")
+        return HTMLResponse(content=html)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Distribution Visualization error: {e}")
+
+# Endpoint 10: Visualize article topic counts (matplotlib image)
+@app.get("/visualize_article_counts")
+async def visualize_article_counts():
+    """
+    Returns a PNG image of a stacked bar chart showing topic counts per article.
+    (For demonstration, using dummy filenames if not provided.)
+    """
+    try:
+        if topic_model is None or training_texts is None:
+            raise HTTPException(status_code=400, detail="Model not trained or training texts not available.")
+        topics, _ = topic_model.transform(training_texts)
+        dummy_filenames = ["Article"] * len(training_texts)
+        df_sim = pd.DataFrame({"filename": dummy_filenames, "topic_number": topics})
+        article_topic_counts = df_sim.groupby('filename')['topic_number'].value_counts().unstack(fill_value=0)
+        article_topic_counts.columns = [f'Topic {i}' for i in article_topic_counts.columns]
+        plt.figure(figsize=(10, 6))
+        article_topic_counts.plot(kind='bar', stacked=True)
+        plt.title('Topic Distribution per Article (Count)')
+        plt.xlabel('Article')
+        plt.ylabel('Count')
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png")
+        buf.seek(0)
+        plt.close()
+        return StreamingResponse(buf, media_type="image/png")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Article Counts Visualization error: {e}")
+
+# Endpoint 11: Visualize article topic proportions (matplotlib image)
+@app.get("/visualize_article_proportions")
+async def visualize_article_proportions():
+    """
+    Returns a PNG image of a stacked bar chart showing topic proportions per article.
+    """
+    try:
+        if topic_model is None or training_texts is None:
+            raise HTTPException(status_code=400, detail="Model not trained or training texts not available.")
+        topics, _ = topic_model.transform(training_texts)
+        dummy_filenames = ["Article"] * len(training_texts)
+        df_sim = pd.DataFrame({"filename": dummy_filenames, "topic_number": topics})
+        article_topic_proportions = df_sim.groupby('filename')['topic_number'].value_counts(normalize=True).unstack(fill_value=0)
+        article_topic_proportions.columns = [f'Topic {i}' for i in article_topic_proportions.columns]
+        plt.figure(figsize=(10, 6))
+        article_topic_proportions.plot(kind='bar', stacked=True)
+        plt.title('Topic Distribution per Article (Proportion)')
+        plt.xlabel('Article')
+        plt.ylabel('Proportion')
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png")
+        buf.seek(0)
+        plt.close()
+        return StreamingResponse(buf, media_type="image/png")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Article Proportions Visualization error: {e}")
+
+# -----------------------
+# RUN THE APPLICATION
+# -----------------------
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
