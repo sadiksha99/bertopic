@@ -55,7 +55,7 @@ original_texts = None         # Original texts (if available) for visualization
 training_probabilities = None # Stored probabilities from training
 
 # -----------------------
-# HELPER: GET TOPIC LABEL (for last 2 visualizations)
+# HELPER: GET TOPIC LABEL (for visualizations)
 # -----------------------
 def get_topic_label(topic_id: int, n_words: int = 3) -> str:
     """
@@ -70,7 +70,6 @@ def get_topic_label(topic_id: int, n_words: int = 3) -> str:
         return f"Topic {topic_id}"
     top_words = [w for (w, _) in words_and_weights[:n_words]]
     return f"Topic {topic_id}: {', '.join(top_words)}"
-
 
 # -----------------------
 # PDF TEXT EXTRACTION FUNCTIONS (Using PyMuPDF)
@@ -196,12 +195,9 @@ def remove_sensitive_info(text: str) -> str:
     if not isinstance(text, str):
         return ""
     doc = nlp(text)
-    # Remove person names
     words = [token.text for token in doc if token.ent_type_ != "PERSON"]
     cleaned_text = " ".join(words)
-    # Remove date-like patterns
     cleaned_text = re.sub(r'\b\d{1,4}[-/]\d{1,2}[-/]\d{1,4}\b', '', cleaned_text)
-    # Remove standalone numbers
     cleaned_text = re.sub(r'\b\d+\b', '', cleaned_text)
     return cleaned_text.strip()
 
@@ -209,32 +205,20 @@ def remove_geographical_entities(text: str) -> str:
     if not isinstance(text, str):
         return ""
     doc = nlp(text)
-    # Remove GPE, LOC, FAC
     filtered_tokens = [token.text for token in doc if token.ent_type_ not in ["GPE", "LOC", "FAC"]]
     return " ".join(filtered_tokens)
 
 def preprocess_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
-    # Remove URLs
     text = re.sub(r'http\S+|www\S+|https\S+', '', text)
-    # Normalize unicode
     text = unicodedata.normalize('NFKD', text)
-    # Keep only letters/spaces
     text = re.sub(r'[^a-zA-Z\s]', ' ', text)
     words = text.lower().split()
-    # Remove stopwords except important ones
-    filtered_words = [
-        w for w in words 
-        if not (w in stop_words and w not in important_stopwords)
-    ]
-    # Lemmatize
+    filtered_words = [w for w in words if not (w in stop_words and w not in important_stopwords)]
     lemmatized = [lemmatizer.lemmatize(w) for w in filtered_words]
-    # Stem
     stemmed = [stemmer.stem(w) for w in lemmatized]
-    # Keep words of length >= 4
     final_words = [w for w in stemmed if len(w) >= 4]
-    # Remove duplicates while preserving order
     unique_words = list(dict.fromkeys(final_words))
     return " ".join(unique_words)
 
@@ -261,7 +245,6 @@ async def extract_clean(
     try:
         all_rows = []
         for file in files:
-            # Handle ZIP
             if file.filename.lower().endswith(".zip"):
                 with tempfile.TemporaryDirectory() as tmpdirname:
                     zip_path = os.path.join(tmpdirname, file.filename)
@@ -269,7 +252,6 @@ async def extract_clean(
                         f.write(await file.read())
                     with zipfile.ZipFile(zip_path, "r") as zip_ref:
                         zip_ref.extractall(tmpdirname)
-
                     for root, _, filenames in os.walk(tmpdirname):
                         for fname in filenames:
                             if fname.lower().endswith(".pdf"):
@@ -278,8 +260,6 @@ async def extract_clean(
                                 all_rows.extend({
                                     "File": r[0], "Page": r[1], "text": r[2]
                                 } for r in extracted)
-
-            # Handle single PDF
             elif file.filename.lower().endswith(".pdf"):
                 contents = await file.read()
                 temp_path = f"temp_{file.filename}"
@@ -290,17 +270,12 @@ async def extract_clean(
                     "File": r[0], "Page": r[1], "text": r[2]
                 } for r in extracted)
                 os.remove(temp_path)
-
             else:
                 raise HTTPException(400, f"Unsupported file type: {file.filename}")
-
         df = pd.DataFrame(all_rows)
-
-        # Clean text
         df["text_clean"] = df["text"].apply(remove_sensitive_info)
         df["text_clean"] = df["text_clean"].apply(remove_geographical_entities)
         df["text_clean"] = df["text_clean"].apply(preprocess_text)
-
         if download:
             output = io.StringIO()
             df.to_csv(output, index=False)
@@ -312,7 +287,6 @@ async def extract_clean(
             )
         else:
             return {"extracted_cleaned_texts": df.to_dict(orient="records")}
-
     except Exception as e:
         raise HTTPException(500, f"Extract and Clean error: {e}")
 
@@ -326,39 +300,40 @@ async def train_model(file: UploadFile = File(...)):
     The model, training texts, and training probabilities are stored globally.
     After training, predictions and visualizations will use the stored model.
     If a 'text' column exists, it is stored as original_texts for visualization; else we use 'text_clean'.
+    This version uses a custom UMAP to ensure a 2D scatter for visualize_documents().
     """
     global topic_model, training_texts, original_texts, training_probabilities
     try:
         contents = await file.read()
         df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
-
-        # We only accept "text_clean"
         if "text_clean" not in df.columns:
             raise HTTPException(
                 status_code=400,
                 detail="CSV must contain a 'text_clean' column."
             )
-
-        # Convert "text_clean" to a list of strings
         training_texts = df["text_clean"].astype(str).tolist()
-
-        # If there's a "text" column, store for visualization
         if "text" in df.columns:
             original_texts = df["text"].astype(str).tolist()
         else:
             original_texts = training_texts
-
-        # Import inside endpoint
         from bertopic import BERTopic
-
-        # Train the model
-        topic_model = BERTopic(calculate_probabilities=True, min_topic_size=10, nr_topics=20)
+        import umap
+        custom_umap = umap.UMAP(
+            n_components=2,
+            n_neighbors=2,
+            metric="cosine"
+        )
+        topic_model = BERTopic(
+            umap_model=custom_umap,
+            calculate_probabilities=True,
+            min_topic_size=10,
+            nr_topics=20
+        )
         topics, training_probabilities_var = topic_model.fit_transform(training_texts)
         training_probabilities = training_probabilities_var
-
         info = topic_model.get_topic_info().to_dict(orient="records")
         return {
-            "detail": "Model trained successfully",
+            "detail": "Model trained successfully (with custom UMAP).",
             "topic_info": info
         }
     except Exception as e:
@@ -399,22 +374,16 @@ async def predict_topics_csv(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
-
-        # We first look for "text_clean". If not found, fallback to "text"
         if "text_clean" in df.columns:
             text_column = "text_clean"
         elif "text" in df.columns:
             text_column = "text"
         else:
-            raise HTTPException(
-                400, "CSV must contain either 'text_clean' or 'text' column for prediction."
-            )
-
+            raise HTTPException(400, "CSV must contain either 'text_clean' or 'text' column for prediction.")
         texts = df[text_column].astype(str).tolist()
         topics, probs = topic_model.transform(texts)
         df["predicted_topic"] = topics
         df["probability"] = [list(prob_row) for prob_row in probs]
-
         output = io.StringIO()
         df.to_csv(output, index=False)
         output.seek(0)
@@ -476,22 +445,60 @@ async def visualize_hierarchy():
         raise HTTPException(500, f"Hierarchy Visualization error: {e}")
 
 # -----------------------
-# 8) VISUALIZE DOCUMENTS (PLOTLY)
+# 8) ALTERNATIVE: VISUALIZE DOCUMENTS (PLOTLY MANUALLY)
 # -----------------------
 @app.get("/visualize_documents", response_class=HTMLResponse)
 async def visualize_documents():
     """
-    Returns an interactive 2D visualization of document embeddings using
+    Returns an interactive 2D scatter plot of document embeddings using
     the original texts (if available) or training texts.
+    This method manually computes embeddings and reduces them to 2D using UMAP.
     """
     if topic_model is None:
         raise HTTPException(400, "Model not trained. Use /train_model first.")
     try:
-        docs = original_texts if original_texts else training_texts
-        fig = topic_model.visualize_documents(docs)
+        docs = original_texts if original_texts is not None else training_texts
+
+        # Try to compute embeddings using the model's embedding_model.
+        embedding_model = topic_model.embedding_model
+        if hasattr(embedding_model, "encode"):
+            embeddings = embedding_model.encode(docs, show_progress_bar=False)
+        elif hasattr(embedding_model, "_model") and hasattr(embedding_model._model, "encode"):
+            embeddings = embedding_model._model.encode(docs, show_progress_bar=False)
+        else:
+            # Fallback to TF-IDF if no encoding method is found.
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            vectorizer = TfidfVectorizer()
+            embeddings = vectorizer.fit_transform(docs).toarray()
+
+        # Reduce embeddings to 2D using UMAP
+        import umap
+        reducer = umap.UMAP(n_components=2, n_neighbors=2, metric="cosine", random_state=42)
+        embeddings_2d = reducer.fit_transform(embeddings)
+
+        # Get predicted topics for each document
+        topics, _ = topic_model.transform(docs)
+        df_plot = pd.DataFrame({
+            "x": embeddings_2d[:, 0],
+            "y": embeddings_2d[:, 1],
+            "Topic": topics,
+            "Document": docs
+        })
+        # Convert topic number to a label using get_topic_label
+        df_plot["Topic Label"] = df_plot["Topic"].apply(lambda t: get_topic_label(t))
+        import plotly.express as px
+        fig = px.scatter(
+            df_plot,
+            x="x",
+            y="y",
+            color="Topic Label",
+            hover_data=["Document"],
+            title="Document Embeddings"
+        )
         return HTMLResponse(fig.to_html(include_plotlyjs="cdn"))
     except Exception as e:
         raise HTTPException(500, f"Documents Visualization error: {e}")
+
 
 # -----------------------
 # 9) VISUALIZE DISTRIBUTION (PLOTLY)
@@ -507,7 +514,6 @@ async def visualize_distribution(doc_index: int = Query(0)):
         raise HTTPException(400, "Model not trained or training texts/probabilities not available.")
     try:
         if doc_index == -1:
-            # Average over all docs
             all_probs = [p.toarray() if hasattr(p, "toarray") else p for p in training_probabilities]
             overall_prob = np.mean(np.vstack(all_probs), axis=0)
             fig = topic_model.visualize_distribution(overall_prob)
@@ -518,7 +524,6 @@ async def visualize_distribution(doc_index: int = Query(0)):
             if hasattr(p, "toarray"):
                 p = p.toarray()
             fig = topic_model.visualize_distribution(p)
-
         return HTMLResponse(fig.to_html(include_plotlyjs="cdn"))
     except Exception as e:
         raise HTTPException(500, f"Distribution Visualization error: {e}")
@@ -543,16 +548,12 @@ async def visualize_article_counts():
         dummy_filenames = ["Article"] * len(training_texts)
         df_sim = pd.DataFrame({"File": dummy_filenames, "topic_number": topics})
         article_topic_counts = df_sim.groupby("File")["topic_number"].value_counts().unstack(fill_value=0)
-
-        # Convert numeric IDs to labels
         article_topic_counts.columns = [get_topic_label(c) for c in article_topic_counts.columns]
-
         plt.figure(figsize=(10, 6))
         article_topic_counts.plot(kind="bar", stacked=True)
         plt.title("Topic Distribution per Article (Count)")
         plt.xlabel("Article")
         plt.ylabel("Count")
-
         buf = io.BytesIO()
         plt.savefig(buf, format="png")
         buf.seek(0)
@@ -581,16 +582,12 @@ async def visualize_article_proportions():
         dummy_filenames = ["Article"] * len(training_texts)
         df_sim = pd.DataFrame({"File": dummy_filenames, "topic_number": topics})
         article_topic_proportions = df_sim.groupby("File")["topic_number"].value_counts(normalize=True).unstack(fill_value=0)
-
-        # Convert numeric IDs to labels
         article_topic_proportions.columns = [get_topic_label(c) for c in article_topic_proportions.columns]
-
         plt.figure(figsize=(10, 6))
         article_topic_proportions.plot(kind="bar", stacked=True)
         plt.title("Topic Distribution per Article (Proportion)")
         plt.xlabel("Article")
         plt.ylabel("Proportion")
-
         buf = io.BytesIO()
         plt.savefig(buf, format="png")
         buf.seek(0)
