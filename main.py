@@ -313,14 +313,7 @@ async def extract_clean(
 # -----------------------
 @app.post("/train_model")
 async def train_model(file: UploadFile = File(...)):
-    """
-    Upload a cleaned CSV file (with 'text_clean' column) to train a BERTopic model.
-    The model, training texts, and training probabilities are stored globally.
-    After training, predictions and visualizations will use the stored model.
-    If a 'text' column exists, it is stored as original_texts for visualization; else we use 'text_clean'.
-    This version uses a custom UMAP to ensure a 2D scatter for visualize_documents().
-    """
-    global topic_model, training_texts, original_texts, training_probabilities
+    global topic_model, training_texts, original_texts, training_probabilities, original_df
     try:
         contents = await file.read()
         df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
@@ -332,6 +325,7 @@ async def train_model(file: UploadFile = File(...)):
             )
 
         training_texts = df["text_clean"].astype(str).tolist()
+        original_df = df  # ✅ keep full CSV for visualizations later
 
         if "text" in df.columns:
             original_texts = df["text"].astype(str).tolist()
@@ -349,7 +343,7 @@ async def train_model(file: UploadFile = File(...)):
             umap_model=custom_umap,
             calculate_probabilities=True,
             min_topic_size=10,
-            nr_topics=20
+            nr_topics=15
         )
         topics, training_probabilities_var = topic_model.fit_transform(training_texts)
         training_probabilities = training_probabilities_var
@@ -556,67 +550,119 @@ async def visualize_distribution(doc_index: int = Query(0)):
 # -----------------------
 # 10) VISUALIZE ARTICLE COUNTS (MATPLOTLIB)
 # -----------------------
+# -----------------------
+# 10) VISUALIZE ARTICLE COUNTS (MATPLOTLIB, UPDATED)
+# -----------------------
 @app.get("/visualize_article_counts")
 async def visualize_article_counts():
     """
-    Returns a PNG stacked bar chart showing topic counts per article.
-    Using top words in the legend via get_topic_label.
+    Large horizontal stacked bar chart showing topic *counts* per PDF file.
+    Y-axis = PDF file names from original_df["File"]
     """
     import matplotlib.pyplot as plt
     import io
 
-    if topic_model is None or training_texts is None:
-        raise HTTPException(400, "Model not trained or training texts not available.")
+    global original_df
+
+    if topic_model is None or training_texts is None or original_df is None:
+        raise HTTPException(400, "Model not trained or original data missing.")
 
     try:
         topics, _ = topic_model.transform(training_texts)
-        dummy_filenames = ["Article"] * len(training_texts)
-        df_sim = pd.DataFrame({"File": dummy_filenames, "topic_number": topics})
-        article_topic_counts = df_sim.groupby("File")["topic_number"].value_counts().unstack(fill_value=0)
-        article_topic_counts.columns = [get_topic_label(c) for c in article_topic_counts.columns]
-        plt.figure(figsize=(10, 6))
-        article_topic_counts.plot(kind="bar", stacked=True)
-        plt.title("Topic Distribution per Article (Count)")
-        plt.xlabel("Article")
-        plt.ylabel("Count")
+
+        df_plot = pd.DataFrame({
+            "File": original_df["File"].astype(str).tolist(),
+            "topic_number": topics
+        })
+
+        topic_counts = (
+            df_plot.groupby("File")["topic_number"]
+            .value_counts()
+            .unstack(fill_value=0)
+            .sort_index()
+        )
+        topic_counts.columns = [f"Topic {i}" for i in topic_counts.columns]
+
+        fig, ax = plt.subplots(figsize=(60, 30), dpi=150)
+        topic_counts.plot(kind="barh", stacked=True, ax=ax)
+
+        ax.set_title("Topic Distribution per PDF (Count)", fontsize=36)
+        ax.set_xlabel("Count", fontsize=28)
+        ax.set_ylabel("PDF File", fontsize=28)
+        ax.tick_params(axis='y', labelsize=18)
+        ax.tick_params(axis='x', labelsize=18)
+        ax.legend(
+            title="Topics",
+            bbox_to_anchor=(1.02, 1),
+            loc="upper left",
+            fontsize=18,
+            title_fontsize=20
+        )
+
+        plt.tight_layout(pad=3)
         buf = io.BytesIO()
         plt.savefig(buf, format="png")
         buf.seek(0)
-        plt.close()
+        plt.close(fig)
         return StreamingResponse(buf, media_type="image/png")
     except Exception as e:
         raise HTTPException(500, f"Article Counts Visualization error: {e}")
 
+
 # -----------------------
-# 11) VISUALIZE ARTICLE PROPORTIONS (MATPLOTLIB)
+# 11) VISUALIZE ARTICLE PROPORTIONS (MATPLOTLIB, UPDATED)
 # -----------------------
 @app.get("/visualize_article_proportions")
 async def visualize_article_proportions():
     """
-    Returns a PNG stacked bar chart showing topic proportions per article.
-    Using top words in the legend via get_topic_label.
+    Large horizontal stacked bar chart showing topic *proportions* per PDF file.
+    Y-axis = PDF file names from original_df["File"]
     """
     import matplotlib.pyplot as plt
     import io
 
-    if topic_model is None or training_texts is None:
-        raise HTTPException(400, "Model not trained or training texts not available.")
+    global original_df
+
+    if topic_model is None or training_texts is None or original_df is None:
+        raise HTTPException(400, "Model not trained or original data missing.")
 
     try:
         topics, _ = topic_model.transform(training_texts)
-        dummy_filenames = ["Article"] * len(training_texts)
-        df_sim = pd.DataFrame({"File": dummy_filenames, "topic_number": topics})
-        article_topic_proportions = df_sim.groupby("File")["topic_number"].value_counts(normalize=True).unstack(fill_value=0)
-        article_topic_proportions.columns = [get_topic_label(c) for c in article_topic_proportions.columns]
-        plt.figure(figsize=(10, 6))
-        article_topic_proportions.plot(kind="bar", stacked=True)
-        plt.title("Topic Distribution per Article (Proportion)")
-        plt.xlabel("Article")
-        plt.ylabel("Proportion")
+
+        df_plot = pd.DataFrame({
+            "File": original_df["File"].astype(str).tolist(),
+            "topic_number": topics
+        })
+
+        topic_props = (
+            df_plot.groupby("File")["topic_number"]
+            .value_counts(normalize=True)
+            .unstack(fill_value=0)
+            .sort_index()
+        )
+        topic_props.columns = [f"Topic {i}" for i in topic_props.columns]
+
+        fig, ax = plt.subplots(figsize=(60, 30), dpi=150)
+        topic_props.plot(kind="barh", stacked=True, ax=ax)
+
+        ax.set_title("Topic Distribution per PDF (Proportion)", fontsize=36)
+        ax.set_xlabel("Proportion", fontsize=28)
+        ax.set_ylabel("PDF File", fontsize=28)
+        ax.tick_params(axis='y', labelsize=18)
+        ax.tick_params(axis='x', labelsize=18)
+        ax.legend(
+            title="Topics",
+            bbox_to_anchor=(1.02, 1),
+            loc="upper left",
+            fontsize=18,
+            title_fontsize=20
+        )
+
+        plt.tight_layout(pad=3)
         buf = io.BytesIO()
         plt.savefig(buf, format="png")
         buf.seek(0)
-        plt.close()
+        plt.close(fig)
         return StreamingResponse(buf, media_type="image/png")
     except Exception as e:
         raise HTTPException(500, f"Article Proportions Visualization error: {e}")
